@@ -127,7 +127,7 @@ if page == "ABC–XYZ Classification":
         st.write(df[["item", "cv", "XYZ"]].head())
 
         st.subheader("ABC–XYZ Matrix")
-        df["ABC_XYZ"] = df["ABC"] + df["XYZ"]
+        df["ABC_XYZ"] = df["ABC"].astype(str) + df["XYZ"].astype(str)
         st.dataframe(df[["item", "ABC", "XYZ", "ABC_XYZ"]])
 
         st.session_state["classified"] = df
