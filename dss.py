@@ -11,7 +11,6 @@ from catboost import CatBoostRegressor
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from scipy.stats import norm
-import io
 
 # =============================================================================
 # 1. VERİ YÜKLEME
@@ -26,7 +25,7 @@ def load_file(uploaded_file):
         return pd.read_excel(uploaded_file)
 
 def clean_raw(df):
-    df = df.rename(columns={
+    rename_map = {
         "Malzeme": "Malzeme",
         "Malzeme kısa metni": "Aciklama",
         "Hareket türleri metni": "HareketTuru",
@@ -34,7 +33,8 @@ def clean_raw(df):
         "Miktar Abs": "Miktar",
         "Temel ölçü birimi": "Birim",
         "WhichDepo?": "Depo"
-    })
+    }
+    df = df.rename(columns=rename_map)
     df["Tarih"] = pd.to_datetime(df["Tarih"], errors="coerce")
     df["Miktar"] = pd.to_numeric(df["Miktar"], errors="coerce").fillna(0)
     df["Malzeme"] = df["Malzeme"].astype(str)
@@ -120,7 +120,52 @@ def ml_forecast(series, model_type="xgboost"):
     return y_test, preds, mae, rmse
 
 # =============================================================================
-# 4. ENVANTER OPTİMİZASYONU
+# 4. ABC – XYZ ANALİZİ
+# =============================================================================
+
+def abc_analysis(monthly_dict):
+    records = []
+    for (code, desc), series in monthly_dict.items():
+        total = series.sum()
+        records.append([code, desc, total])
+
+    df = pd.DataFrame(records, columns=["Malzeme", "Aciklama", "ToplamTalep"])
+    df = df.sort_values("ToplamTalep", ascending=False)
+    df["Kümülatif"] = df["ToplamTalep"].cumsum()
+    df["KümülatifOran"] = df["Kümülatif"] / df["ToplamTalep"].sum()
+
+    def abc_class(x):
+        if x <= 0.80:
+            return "A"
+        elif x <= 0.95:
+            return "B"
+        else:
+            return "C"
+
+    df["ABC"] = df["KümülatifOran"].apply(abc_class)
+    return df
+
+def xyz_analysis(monthly_dict):
+    records = []
+    for (code, desc), series in monthly_dict.items():
+        mean = series.mean()
+        std = series.std()
+        cv = std / mean if mean > 0 else 999
+
+        if cv < 0.5:
+            xyz = "X"
+        elif cv < 1.0:
+            xyz = "Y"
+        else:
+            xyz = "Z"
+
+        records.append([code, desc, mean, std, cv, xyz])
+
+    df = pd.DataFrame(records, columns=["Malzeme", "Aciklama", "Mean", "Std", "CV", "XYZ"])
+    return df
+
+# =============================================================================
+# 5. ENVANTER OPTİMİZASYONU
 # =============================================================================
 
 def inventory_metrics(series, service=0.95, lt=7, order_cost=2000, hold_pct=0.25, unit_cost=1):
@@ -158,11 +203,11 @@ def inventory_metrics(series, service=0.95, lt=7, order_cost=2000, hold_pct=0.25
     }
 
 # =============================================================================
-# 5. STREAMLIT ARAYÜZÜ
+# 6. STREAMLIT ARAYÜZÜ
 # =============================================================================
 
 st.set_page_config(page_title="DSS", layout="wide")
-st.title("📦 Çok Aşamalı Karar Destek Sistemi")
+st.title("📦 Entegre Karar Destek Sistemi")
 
 # -------------------------
 # ADIM 1 — VERİ YÜKLEME
@@ -182,120 +227,137 @@ st.success("Veri başarıyla yüklendi!")
 # -------------------------
 # ADIM 2 — EDA
 # -------------------------
-st.header("2️⃣ EDA — Keşifsel Veri Analizi")
-st.write(df.head())
-st.write("Toplam kayıt:", len(df))
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["📊 EDA", "⏳ Time Series", "🧮 ABC–XYZ", "📈 Forecast", "📦 Envanter", "📋 Dashboard", "ℹ Bilgi"]
+)
+
+with tab1:
+    st.header("📊 EDA — Keşifsel Veri Analizi")
+    st.write(df.head())
+    st.write("Toplam kayıt:", len(df))
 
 # -------------------------
 # ADIM 3 — TIME SERIES
 # -------------------------
-st.header("3️⃣ Zaman Serisi Oluşturma")
-
 monthly = get_monthly(df)
 weekly = get_weekly(df)
 
-if len(monthly) == 0:
-    st.error("Aylık seri oluşturulamadı.")
-    st.stop()
-
 items = [f"{c} - {d}" for (c,d) in monthly.keys()]
-selected = st.selectbox("Ürün seçin", items)
+selected = st.sidebar.selectbox("Ürün seçin", items)
 
 key = list(monthly.keys())[items.index(selected)]
 code, desc = key
 series_m = monthly[key]
 
-st.subheader("Aylık Talep Serisi")
-st.line_chart(series_m)
+with tab2:
+    st.header("⏳ Zaman Serisi")
+    st.line_chart(series_m)
 
 # -------------------------
-# ADIM 4 — FORECAST
+# ADIM 4 — ABC–XYZ
 # -------------------------
-st.header("4️⃣ Tahmin Modülleri")
+with tab3:
+    st.header("🧮 ABC – XYZ Analizi")
 
-col1, col2, col3 = st.columns(3)
+    df_abc = abc_analysis(monthly)
+    df_xyz = xyz_analysis(monthly)
 
-with col1:
-    st.subheader("ARIMA")
-    fc_arima = arima_forecast(series_m)
+    st.subheader("ABC Analizi")
+    st.dataframe(df_abc)
+
+    st.subheader("XYZ Analizi")
+    st.dataframe(df_xyz)
+
+    st.subheader("ABC–XYZ Matrisi")
+    merged = df_abc.merge(df_xyz[["Malzeme", "XYZ"]], on="Malzeme")
+    merged["ABC_XYZ"] = merged["ABC"] + merged["XYZ"]
+    st.dataframe(merged)
+
+# -------------------------
+# ADIM 5 — FORECAST
+# -------------------------
+with tab4:
+    st.header("📈 Tahmin Modülleri")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.subheader("ARIMA")
+        fc_arima = arima_forecast(series_m)
+        if fc_arima is not None:
+            st.line_chart(fc_arima)
+        else:
+            st.warning("ARIMA tahmini yapılamadı.")
+
+    with col2:
+        st.subheader("XGBoost")
+        y_test_xgb, preds_xgb, mae_xgb, rmse_xgb = ml_forecast(series_m, "xgboost")
+        if preds_xgb is not None:
+            st.write(f"MAE: {mae_xgb:.2f}, RMSE: {rmse_xgb:.2f}")
+            st.line_chart(pd.DataFrame({"Gerçek": y_test_xgb, "Tahmin": preds_xgb}))
+        else:
+            st.warning("Yetersiz veri.")
+
+    with col3:
+        st.subheader("CatBoost")
+        y_test_cat, preds_cat, mae_cat, rmse_cat = ml_forecast(series_m, "catboost")
+        if preds_cat is not None:
+            st.write(f"MAE: {mae_cat:.2f}, RMSE: {rmse_cat:.2f}")
+            st.line_chart(pd.DataFrame({"Gerçek": y_test_cat, "Tahmin": preds_cat}))
+        else:
+            st.warning("Yetersiz veri.")
+
+# -------------------------
+# ADIM 6 — ENVANTER OPTİMİZASYONU
+# -------------------------
+with tab5:
+    st.header("📦 Envanter Optimizasyonu")
+
+    service = st.slider("Servis Seviyesi", 0.80, 0.999, 0.95)
+    lt = st.number_input("Teslim Süresi (gün)", 1, 60, 7)
+    order_cost = st.number_input("Sipariş Maliyeti", 1.0, 10000.0, 2000.0)
+    hold_pct = st.number_input("Stok Bulundurma Oranı", 0.01, 1.0, 0.25)
+    unit_cost = st.number_input("Birim Maliyet", 0.1, 1000.0, 1.0)
+
+    metrics = inventory_metrics(series_m, service, lt, order_cost, hold_pct, unit_cost)
+
+    if metrics:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Güvenlik Stoğu", f"{metrics['safety_stock']:.1f}")
+        col2.metric("ROP", f"{metrics['reorder_point']:.1f}")
+        col3.metric("EOQ", f"{metrics['eoq']:.1f}")
+    else:
+        st.warning("Envanter hesapları için yeterli veri yok.")
+
+# -------------------------
+# ADIM 7 — DASHBOARD
+# -------------------------
+with tab6:
+    st.header("📋 Dashboard — Özet")
+
+    st.subheader("Ürün Bilgisi")
+    st.write(f"**Kod:** {code}")
+    st.write(f"**Açıklama:** {desc}")
+
+    st.subheader("Aylık Talep")
+    st.line_chart(series_m)
+
+    st.subheader("Tahmin Sonuçları")
     if fc_arima is not None:
+        st.write("ARIMA Tahmini")
         st.line_chart(fc_arima)
-    else:
-        st.warning("ARIMA tahmini yapılamadı.")
 
-with col2:
-    st.subheader("XGBoost")
-    y_test_xgb, preds_xgb, mae_xgb, rmse_xgb = ml_forecast(series_m, "xgboost")
     if preds_xgb is not None:
-        st.write(f"MAE: {mae_xgb:.2f}, RMSE: {rmse_xgb:.2f}")
+        st.write("XGBoost Tahmini")
         st.line_chart(pd.DataFrame({"Gerçek": y_test_xgb, "Tahmin": preds_xgb}))
-    else:
-        st.warning("Yetersiz veri.")
 
-with col3:
-    st.subheader("CatBoost")
-    y_test_cat, preds_cat, mae_cat, rmse_cat = ml_forecast(series_m, "catboost")
     if preds_cat is not None:
-        st.write(f"MAE: {mae_cat:.2f}, RMSE: {rmse_cat:.2f}")
+        st.write("CatBoost Tahmini")
         st.line_chart(pd.DataFrame({"Gerçek": y_test_cat, "Tahmin": preds_cat}))
-    else:
-        st.warning("Yetersiz veri.")
 
-# -------------------------
-# ADIM 5 — ENVANTER OPTİMİZASYONU
-# -------------------------
-st.header("5️⃣ Envanter Optimizasyonu")
+    st.subheader("Envanter Metrikleri")
+    st.write(metrics if metrics else "Hesaplanamadı.")
 
-service = st.slider("Servis Seviyesi", 0.80, 0.999, 0.95)
-lt = st.number_input("Teslim Süresi (gün)", 1, 60, 7)
-order_cost = st.number_input("Sipariş Maliyeti", 1.0, 10000.0, 2000.0)
-hold_pct = st.number_input("Stok Bulundurma Oranı", 0.01, 1.0, 0.25)
-unit_cost = st.number_input("Birim Maliyet", 0.1, 1000.0, 1.0)
-
-metrics = inventory_metrics(series_m, service, lt, order_cost, hold_pct, unit_cost)
-
-if metrics:
-    st.metric("Güvenlik Stoğu", f"{metrics['safety_stock']:.1f}")
-    st.metric("ROP", f"{metrics['reorder_point']:.1f}")
-    st.metric("EOQ", f"{metrics['eoq']:.1f}")
-else:
-    st.warning("Envanter hesapları için yeterli veri yok.")
-
-# -------------------------
-# ADIM 6 — DASHBOARD
-# -------------------------
-st.header("6️⃣ Dashboard — Özet")
-
-st.subheader("Ürün Bilgisi")
-st.write(f"**Kod:** {code}")
-st.write(f"**Açıklama:** {desc}")
-
-st.subheader("Aylık Talep")
-st.line_chart(series_m)
-
-st.subheader("Tahmin Sonuçları")
-if fc_arima is not None:
-    st.write("ARIMA Tahmini")
-    st.line_chart(fc_arima)
-
-if preds_xgb is not None:
-    st.write("XGBoost Tahmini")
-    st.line_chart(pd.DataFrame({"Gerçek": y_test_xgb, "Tahmin": preds_xgb}))
-
-if preds_cat is not None:
-    st.write("CatBoost Tahmini")
-    st.line_chart(pd.DataFrame({"Gerçek": y_test_cat, "Tahmin": preds_cat}))
-
-st.subheader("Envanter Metrikleri")
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Aylık Ortalama", f"{metrics['mean_monthly']:.1f}")
-col2.metric("Aylık Std", f"{metrics['std_monthly']:.1f}")
-col3.metric("Günlük Ortalama", f"{metrics['mean_daily']:.2f}")
-
-col4, col5, col6 = st.columns(3)
-col4.metric("Günlük Std", f"{metrics['std_daily']:.2f}")
-col5.metric("Güvenlik Stoğu", f"{metrics['safety_stock']:.1f}")
-col6.metric("ROP", f"{metrics['reorder_point']:.1f}")
-
-st.metric("EOQ", f"{metrics['eoq']:.1f}")
+with tab7:
+    st.header("ℹ Bilgi")
+    st.write("Bu DSS, ABC–XYZ + Forecast + Envanter optimizasyonunu tek arayüzde birleştirir.")
