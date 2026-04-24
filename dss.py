@@ -287,4 +287,15 @@ if preds_cat is not None:
     st.line_chart(pd.DataFrame({"Gerçek": y_test_cat, "Tahmin": preds_cat}))
 
 st.subheader("Envanter Metrikleri")
-st.write(metrics if metrics else "Hesaplanamadı.")
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Aylık Ortalama", f"{metrics['mean_monthly']:.1f}")
+col2.metric("Aylık Std", f"{metrics['std_monthly']:.1f}")
+col3.metric("Günlük Ortalama", f"{metrics['mean_daily']:.2f}")
+
+col4, col5, col6 = st.columns(3)
+col4.metric("Günlük Std", f"{metrics['std_daily']:.2f}")
+col5.metric("Güvenlik Stoğu", f"{metrics['safety_stock']:.1f}")
+col6.metric("ROP", f"{metrics['reorder_point']:.1f}")
+
+st.metric("EOQ", f"{metrics['eoq']:.1f}")
