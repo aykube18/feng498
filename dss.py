@@ -213,10 +213,8 @@ def calculate_reorder_point(mean_daily: float, std_daily: float,
                             distribution: str = "normal") -> float:
     if mean_daily <= 0:
         return 0.0
-
     lt_mean = mean_daily * lead_time_days
     lt_std = std_daily * math.sqrt(lead_time_days)
-
     try:
         z = norm.ppf(service_level)
         return max(0.0, lt_mean + z * lt_std)
@@ -229,13 +227,10 @@ def calculate_eoq(mean_daily: float,
                   unit_cost: float = UNIT_COST) -> float:
     if mean_daily <= 0:
         return 1.0
-
     annual_demand = mean_daily * 365
     holding_cost = holding_cost_pct * unit_cost
-
     if holding_cost <= 0 or annual_demand <= 0:
         return max(mean_daily * 30, 1)
-
     try:
         eoq = math.sqrt((2 * annual_demand * ordering_cost) / holding_cost)
         return max(1.0, eoq)
@@ -364,9 +359,9 @@ def color_abc_xyz(val):
 # =============================================================================
 
 st.set_page_config(page_title="DSS", layout="wide")
-st.title("📦 Integrated Decision Support System")
+st.title("Integrated Decision Support System")
 
-st.header("1️⃣ Data Upload")
+st.header("Data Upload")
 uploaded = st.file_uploader("Upload Excel (xlsx/xls) or CSV", type=["xlsx","xls","csv"])
 
 if uploaded is None:
@@ -382,14 +377,14 @@ df = clean_raw(df)
 st.success("Data successfully loaded!")
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["📊 EDA", "🧮 ABC–XYZ", "📈 Forecast", "📦 Inventory", "⏳ Time Series", "📋 Dashboard", "ℹ Info"]
+    ["EDA", "ABC-XYZ", "Forecast", "Inventory", "Time Series", "Dashboard", "Info"]
 )
 
 # -------------------------
 # TAB 1 — EDA
 # -------------------------
 with tab1:
-    st.header("📊 Exploratory Data Analysis")
+    st.header("Exploratory Data Analysis")
     st.write(df.head())
     st.write("Total records:", len(df))
 
@@ -400,7 +395,7 @@ monthly = get_monthly(df)
 weekly = get_weekly(df)
 
 if not monthly:
-    st.warning("No sufficient monthly data for time series and ABC–XYZ. Check your file.")
+    st.warning("No sufficient monthly data for time series and ABC-XYZ. Check your file.")
     series_m = None
     code, desc = "", ""
 else:
@@ -414,10 +409,10 @@ else:
 # TAB 2 — ABC–XYZ
 # -------------------------
 with tab2:
-    st.header("🧮 ABC–XYZ Analysis")
+    st.header("ABC-XYZ Analysis")
 
     if not monthly:
-        st.info("ABC–XYZ analysis is not available because monthly data is insufficient.")
+        st.info("ABC-XYZ analysis is not available because monthly data is insufficient.")
     else:
         df_abc = abc_analysis(monthly)
         df_xyz = xyz_analysis(monthly)
@@ -428,23 +423,34 @@ with tab2:
         st.subheader("XYZ Analysis")
         st.dataframe(df_xyz)
 
-        st.subheader("ABC–XYZ Matrix")
+        st.subheader("ABC-XYZ Matrix")
         try:
             merged = df_abc.merge(df_xyz[["Material", "XYZ"]], on="Material", how="left")
             merged["ABC_XYZ"] = merged["ABC"].fillna("") + merged["XYZ"].fillna("")
+
             if isinstance(merged, pd.DataFrame) and not merged.empty:
-                styled = merged.style.applymap(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
+                # -------------------------------------------------------
+                # DUZELTME: applymap() pandas>=2.1'de kaldirildi.
+                # Yeni API: Styler.map() kullanimiyla degistirildi.
+                # -------------------------------------------------------
+                try:
+                    # pandas >= 2.1: map() kullan
+                    styled = merged.style.map(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
+                except AttributeError:
+                    # pandas < 2.1: applymap() kullan (eski surum fallback)
+                    styled = merged.style.applymap(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
+
                 st.markdown(styled.to_html(), unsafe_allow_html=True)
             else:
-                st.warning("ABC–XYZ matrix could not be created. Check data consistency.")
+                st.warning("ABC-XYZ matrix could not be created. Check data consistency.")
         except Exception as e:
-            st.error(f"Error while creating ABC–XYZ matrix: {e}")
+            st.error(f"Error while creating ABC-XYZ matrix: {e}")
 
 # -------------------------
 # TAB 3 — FORECAST
 # -------------------------
 with tab3:
-    st.header("📈 Forecasting Models")
+    st.header("Forecasting Models")
 
     if series_m is None:
         st.info("Forecasting is not available because no product could be selected.")
@@ -481,7 +487,7 @@ with tab3:
 # TAB 4 — INVENTORY (SPLIT LAYOUT)
 # -------------------------
 with tab4:
-    st.header("📦 Inventory Optimization — Simulation Based")
+    st.header("Inventory Optimization - Simulation Based")
 
     if series_m is None:
         st.info("Inventory optimization is not available because no product could be selected.")
@@ -532,7 +538,7 @@ with tab4:
                 result, history = simulate_inventory_with_real_data(item, rop, eoq)
 
                 colm1, colm2 = st.columns(2)
-                colm1.metric("Avg Inventory (≥0)", f"{result['avg_inventory']:.1f}")
+                colm1.metric("Avg Inventory (>=0)", f"{result['avg_inventory']:.1f}")
                 colm2.metric("Min Inventory", f"{result['min_inventory']:.1f}")
                 colm3, colm4 = st.columns(2)
                 colm3.metric("Max Inventory", f"{result['max_inventory']:.1f}")
@@ -554,13 +560,15 @@ with tab4:
                 fig1, ax1 = plt.subplots(figsize=(8, 4))
                 ax1.plot(days, inventory, label="Inventory Level", color="#DC2626", linewidth=1.8)
                 ax1.axhline(0, color="black", linewidth=1, linestyle="--", alpha=0.5)
-                ax1.axhline(result["reorder_point"], color="#16A34A", linestyle="--", linewidth=1.5, label="ROP")
+                ax1.axhline(result["reorder_point"], color="#16A34A", linestyle="--",
+                            linewidth=1.5, label="ROP")
                 ax1.set_xlabel("Day")
                 ax1.set_ylabel("Inventory")
-                ax1.set_title(f"Inventory Trajectory — {code}")
+                ax1.set_title(f"Inventory Trajectory - {code}")
                 ax1.legend()
                 ax1.grid(alpha=0.3)
                 st.pyplot(fig1)
+                plt.close(fig1)
 
                 fig2, ax2 = plt.subplots(figsize=(8, 3))
                 ax2.plot(days, demand, color="#2563EB", linewidth=1.5)
@@ -569,6 +577,7 @@ with tab4:
                 ax2.set_title("Daily Demand (Simulated)")
                 ax2.grid(alpha=0.3)
                 st.pyplot(fig2)
+                plt.close(fig2)
 
                 fig3, ax3 = plt.subplots(figsize=(8, 3))
                 ax3.hist(demand, bins=30, color="#0EA5E9", alpha=0.8, edgecolor="white")
@@ -576,12 +585,13 @@ with tab4:
                 ax3.set_ylabel("Frequency")
                 ax3.set_title("Demand Distribution (Simulated)")
                 st.pyplot(fig3)
+                plt.close(fig3)
 
 # -------------------------
 # TAB 5 — TIME SERIES
 # -------------------------
 with tab5:
-    st.header("⏳ Time Series")
+    st.header("Time Series")
     if series_m is None:
         st.info("Time series is not available because no product could be selected.")
     else:
@@ -591,7 +601,7 @@ with tab5:
 # TAB 6 — DASHBOARD
 # -------------------------
 with tab6:
-    st.header("📋 Dashboard — Summary")
+    st.header("Dashboard - Summary")
 
     if series_m is None:
         st.info("Dashboard is not available because no product could be selected.")
@@ -630,11 +640,11 @@ with tab6:
 # TAB 7 — INFO
 # -------------------------
 with tab7:
-    st.header("ℹ Info")
+    st.header("Info")
     st.markdown("""
 This integrated DSS includes:
 - EDA
-- ABC–XYZ classification (with color-coded matrix)
+- ABC-XYZ classification (with color-coded matrix)
 - Forecasting (ARIMA, XGBoost, CatBoost)
 - Simulation-based inventory optimization (ROP, EOQ, stockouts, fill rate)
 - Time series visualization
