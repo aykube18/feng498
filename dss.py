@@ -359,7 +359,7 @@ def color_abc_xyz(val):
 # =============================================================================
 
 st.set_page_config(page_title="DSS", layout="wide")
-st.title("📦 Integrated Decision Support System"")
+st.title("📦 Integrated Decision Support System")
 
 st.header("1️⃣ Data Upload")
 uploaded = st.file_uploader("Upload Excel (xlsx/xls) or CSV", type=["xlsx","xls","csv"])
