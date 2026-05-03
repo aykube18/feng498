@@ -407,7 +407,7 @@ with tab2:
     merged["ABC_XYZ"] = merged["ABC"] + merged["XYZ"]
 
     styled = merged.style.applymap(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
-    st.dataframe(styled, use_container_width=True)
+    st.markdown(styled.to_html(), unsafe_allow_html=True)
 
 # -------------------------
 # TAB 3 — FORECAST
