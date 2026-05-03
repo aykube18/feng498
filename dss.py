@@ -48,6 +48,8 @@ def clean_raw(df):
 
 def get_monthly(df):
     result = {}
+    if df.empty:
+        return result
     for (code, desc), grp in df.groupby(["Material", "Description"]):
         m = grp.set_index("Date")["Quantity"].resample("MS").sum()
         if len(m) < 6:
@@ -59,6 +61,8 @@ def get_monthly(df):
 
 def get_weekly(df):
     result = {}
+    if df.empty:
+        return result
     for (code, desc), grp in df.groupby(["Material", "Description"]):
         w = grp.set_index("Date")["Quantity"].resample("W").sum()
         if len(w) < 20:
@@ -73,12 +77,14 @@ def get_weekly(df):
 # =============================================================================
 
 def arima_forecast(series, horizon=6):
+    if series is None or len(series) < 6:
+        return None
     try:
         model = ARIMA(series, order=(1,1,1))
         res = model.fit()
         fc = res.forecast(steps=horizon)
         return fc
-    except:
+    except Exception:
         return None
 
 def make_features(series, lags=12):
@@ -90,6 +96,9 @@ def make_features(series, lags=12):
     return df.dropna()
 
 def ml_forecast(series, model_type="xgboost"):
+    if series is None or len(series) < 20:
+        return None, None, None, None
+
     df = make_features(series)
     if len(df) < 20:
         return None, None, None, None
@@ -98,6 +107,9 @@ def ml_forecast(series, model_type="xgboost"):
     y = df["y"]
 
     split = int(len(df)*0.8)
+    if split == 0 or split >= len(df):
+        return None, None, None, None
+
     X_train, X_test = X.iloc[:split], X.iloc[split:]
     y_train, y_test = y.iloc[:split], y.iloc[split:]
 
@@ -130,10 +142,17 @@ def abc_analysis(monthly_dict):
         total = series.sum()
         records.append([code, desc, total])
 
+    if not records:
+        return pd.DataFrame(columns=["Material", "Description", "TotalDemand", "Cumulative", "CumulativeRatio", "ABC"])
+
     df = pd.DataFrame(records, columns=["Material", "Description", "TotalDemand"])
     df = df.sort_values("TotalDemand", ascending=False)
     df["Cumulative"] = df["TotalDemand"].cumsum()
-    df["CumulativeRatio"] = df["Cumulative"] / df["TotalDemand"].sum()
+    total_sum = df["TotalDemand"].sum()
+    if total_sum == 0:
+        df["CumulativeRatio"] = 0
+    else:
+        df["CumulativeRatio"] = df["Cumulative"] / total_sum
 
     def abc_class(x):
         if x <= 0.80:
@@ -162,11 +181,14 @@ def xyz_analysis(monthly_dict):
 
         records.append([code, desc, mean, std, cv, xyz])
 
+    if not records:
+        return pd.DataFrame(columns=["Material", "Description", "Mean", "Std", "CV", "XYZ"])
+
     df = pd.DataFrame(records, columns=["Material", "Description", "Mean", "Std", "CV", "XYZ"])
     return df
 
 # =============================================================================
-# 5. INVENTORY LOGIC (UPDATED, SIMULATION-BASED)
+# 5. INVENTORY LOGIC (SIMULATION-BASED)
 # =============================================================================
 
 SERVICE_LEVEL = 0.95
@@ -196,14 +218,9 @@ def calculate_reorder_point(mean_daily: float, std_daily: float,
     lt_std = std_daily * math.sqrt(lead_time_days)
 
     try:
-        if distribution == "normal":
-            z = norm.ppf(service_level)
-            return max(0.0, lt_mean + z * lt_std)
-        else:
-            # basitleştirilmiş: diğer dağılımlar için de normal yaklaşım
-            z = norm.ppf(service_level)
-            return max(0.0, lt_mean + z * lt_std)
-    except:
+        z = norm.ppf(service_level)
+        return max(0.0, lt_mean + z * lt_std)
+    except Exception:
         return max(0.0, lt_mean)
 
 def calculate_eoq(mean_daily: float,
@@ -222,7 +239,7 @@ def calculate_eoq(mean_daily: float,
     try:
         eoq = math.sqrt((2 * annual_demand * ordering_cost) / holding_cost)
         return max(1.0, eoq)
-    except:
+    except Exception:
         return max(mean_daily * 30, 1)
 
 def _generate_daily_demand(mean_daily: float, std_daily: float,
@@ -272,7 +289,6 @@ def simulate_inventory_with_real_data(item: MaterialItem,
     stockout_days = 0
 
     for day in range(simulation_days):
-        # receive orders
         received = 0
         still_pending = []
         for arrival_day, qty in pending_orders:
@@ -311,8 +327,8 @@ def simulate_inventory_with_real_data(item: MaterialItem,
 
     result = {
         "avg_inventory": float(inv_arr[inv_arr >= 0].mean()) if np.any(inv_arr >= 0) else 0.0,
-        "min_inventory": float(inv_arr.min()),
-        "max_inventory": float(inv_arr.max()),
+        "min_inventory": float(inv_arr.min()) if len(inv_arr) > 0 else 0.0,
+        "max_inventory": float(inv_arr.max()) if len(inv_arr) > 0 else 0.0,
         "total_demand": total_demand,
         "total_shortage": total_shortage,
         "stockout_days": stockout_days,
@@ -358,10 +374,13 @@ if uploaded is None:
     st.stop()
 
 df = load_file(uploaded)
+if df is None or df.empty:
+    st.error("Loaded file is empty or invalid.")
+    st.stop()
+
 df = clean_raw(df)
 st.success("Data successfully loaded!")
 
-# Correct logical order
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     ["📊 EDA", "🧮 ABC–XYZ", "📈 Forecast", "📦 Inventory", "⏳ Time Series", "📋 Dashboard", "ℹ Info"]
 )
@@ -380,12 +399,16 @@ with tab1:
 monthly = get_monthly(df)
 weekly = get_weekly(df)
 
-items = [f"{c} - {d}" for (c,d) in monthly.keys()]
-selected = st.sidebar.selectbox("Select a product", items)
-
-key = list(monthly.keys())[items.index(selected)]
-code, desc = key
-series_m = monthly[key]
+if not monthly:
+    st.warning("No sufficient monthly data for time series and ABC–XYZ. Check your file.")
+    series_m = None
+    code, desc = "", ""
+else:
+    items_list = [f"{c} - {d}" for (c, d) in monthly.keys()]
+    selected = st.sidebar.selectbox("Select a product", items_list)
+    key = list(monthly.keys())[items_list.index(selected)]
+    code, desc = key
+    series_m = monthly[key]
 
 # -------------------------
 # TAB 2 — ABC–XYZ
@@ -393,21 +416,29 @@ series_m = monthly[key]
 with tab2:
     st.header("🧮 ABC–XYZ Analysis")
 
-    df_abc = abc_analysis(monthly)
-    df_xyz = xyz_analysis(monthly)
+    if not monthly:
+        st.info("ABC–XYZ analysis is not available because monthly data is insufficient.")
+    else:
+        df_abc = abc_analysis(monthly)
+        df_xyz = xyz_analysis(monthly)
 
-    st.subheader("ABC Analysis")
-    st.dataframe(df_abc)
+        st.subheader("ABC Analysis")
+        st.dataframe(df_abc)
 
-    st.subheader("XYZ Analysis")
-    st.dataframe(df_xyz)
+        st.subheader("XYZ Analysis")
+        st.dataframe(df_xyz)
 
-    st.subheader("ABC–XYZ Matrix")
-    merged = df_abc.merge(df_xyz[["Material", "XYZ"]], on="Material")
-    merged["ABC_XYZ"] = merged["ABC"] + merged["XYZ"]
-
-    styled = merged.style.applymap(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
-    st.markdown(styled.to_html(), unsafe_allow_html=True)
+        st.subheader("ABC–XYZ Matrix")
+        try:
+            merged = df_abc.merge(df_xyz[["Material", "XYZ"]], on="Material", how="left")
+            merged["ABC_XYZ"] = merged["ABC"].fillna("") + merged["XYZ"].fillna("")
+            if isinstance(merged, pd.DataFrame) and not merged.empty:
+                styled = merged.style.applymap(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
+                st.markdown(styled.to_html(), unsafe_allow_html=True)
+            else:
+                st.warning("ABC–XYZ matrix could not be created. Check data consistency.")
+        except Exception as e:
+            st.error(f"Error while creating ABC–XYZ matrix: {e}")
 
 # -------------------------
 # TAB 3 — FORECAST
@@ -415,33 +446,36 @@ with tab2:
 with tab3:
     st.header("📈 Forecasting Models")
 
-    col1, col2, col3 = st.columns(3)
+    if series_m is None:
+        st.info("Forecasting is not available because no product could be selected.")
+    else:
+        col1, col2, col3 = st.columns(3)
 
-    with col1:
-        st.subheader("ARIMA")
-        fc_arima = arima_forecast(series_m)
-        if fc_arima is not None:
-            st.line_chart(fc_arima)
-        else:
-            st.warning("ARIMA forecast could not be generated.")
+        with col1:
+            st.subheader("ARIMA")
+            fc_arima = arima_forecast(series_m)
+            if fc_arima is not None:
+                st.line_chart(fc_arima)
+            else:
+                st.warning("ARIMA forecast could not be generated.")
 
-    with col2:
-        st.subheader("XGBoost")
-        y_test_xgb, preds_xgb, mae_xgb, rmse_xgb = ml_forecast(series_m, "xgboost")
-        if preds_xgb is not None:
-            st.write(f"MAE: {mae_xgb:.2f}, RMSE: {rmse_xgb:.2f}")
-            st.line_chart(pd.DataFrame({"Actual": y_test_xgb, "Prediction": preds_xgb}))
-        else:
-            st.warning("Insufficient data.")
+        with col2:
+            st.subheader("XGBoost")
+            y_test_xgb, preds_xgb, mae_xgb, rmse_xgb = ml_forecast(series_m, "xgboost")
+            if preds_xgb is not None:
+                st.write(f"MAE: {mae_xgb:.2f}, RMSE: {rmse_xgb:.2f}")
+                st.line_chart(pd.DataFrame({"Actual": y_test_xgb, "Prediction": preds_xgb}))
+            else:
+                st.warning("Insufficient data for XGBoost.")
 
-    with col3:
-        st.subheader("CatBoost")
-        y_test_cat, preds_cat, mae_cat, rmse_cat = ml_forecast(series_m, "catboost")
-        if preds_cat is not None:
-            st.write(f"MAE: {mae_cat:.2f}, RMSE: {rmse_cat:.2f}")
-            st.line_chart(pd.DataFrame({"Actual": y_test_cat, "Prediction": preds_cat}))
-        else:
-            st.warning("Insufficient data.")
+        with col3:
+            st.subheader("CatBoost")
+            y_test_cat, preds_cat, mae_cat, rmse_cat = ml_forecast(series_m, "catboost")
+            if preds_cat is not None:
+                st.write(f"MAE: {mae_cat:.2f}, RMSE: {rmse_cat:.2f}")
+                st.line_chart(pd.DataFrame({"Actual": y_test_cat, "Prediction": preds_cat}))
+            else:
+                st.warning("Insufficient data for CatBoost.")
 
 # -------------------------
 # TAB 4 — INVENTORY (SPLIT LAYOUT)
@@ -449,102 +483,109 @@ with tab3:
 with tab4:
     st.header("📦 Inventory Optimization — Simulation Based")
 
-    # derive daily stats from monthly series
-    mean_monthly = series_m.mean()
-    std_monthly = series_m.std()
-    mean_daily = mean_monthly / 30 if mean_monthly > 0 else 0.0
-    std_daily = std_monthly / 30 if std_monthly > 0 else 0.0
+    if series_m is None:
+        st.info("Inventory optimization is not available because no product could be selected.")
+    else:
+        mean_monthly = series_m.mean()
+        std_monthly = series_m.std()
+        mean_daily = mean_monthly / 30 if mean_monthly > 0 else 0.0
+        std_daily = std_monthly / 30 if std_monthly > 0 else 0.0
 
-    col_left, col_right = st.columns([1, 1.4])
+        col_left, col_right = st.columns([1, 1.4])
 
-    with col_left:
-        st.subheader("Parameters")
+        with col_left:
+            st.subheader("Parameters")
 
-        service = st.slider("Service Level", 0.80, 0.999, SERVICE_LEVEL)
-        lt = st.number_input("Lead Time (days)", 1, 60, DEFAULT_LEAD_TIME_DAYS)
-        order_cost = st.number_input("Order Cost", 1.0, 10000.0, ORDERING_COST)
-        hold_pct = st.number_input("Holding Cost Rate", 0.01, 1.0, HOLDING_COST_PCT)
-        unit_cost = st.number_input("Unit Cost", 0.1, 1000.0, UNIT_COST)
+            service = st.slider("Service Level", 0.80, 0.999, SERVICE_LEVEL)
+            lt = st.number_input("Lead Time (days)", 1, 60, DEFAULT_LEAD_TIME_DAYS)
+            order_cost = st.number_input("Order Cost", 1.0, 10000.0, ORDERING_COST)
+            hold_pct = st.number_input("Holding Cost Rate", 0.01, 1.0, HOLDING_COST_PCT)
+            unit_cost = st.number_input("Unit Cost", 0.1, 1000.0, UNIT_COST)
 
-        if mean_daily <= 0:
-            st.warning("Not enough demand data to compute inventory metrics.")
-        else:
-            item = MaterialItem(
-                code=str(code),
-                name=str(desc),
-                mean_daily=mean_daily,
-                std_daily=std_daily,
-                distribution="gamma",
-                lead_time_days=int(lt),
-            )
+            if mean_daily <= 0:
+                st.warning("Not enough demand data to compute inventory metrics.")
+                result = None
+                history = None
+            else:
+                item = MaterialItem(
+                    code=str(code),
+                    name=str(desc),
+                    mean_daily=mean_daily,
+                    std_daily=std_daily,
+                    distribution="gamma",
+                    lead_time_days=int(lt),
+                )
 
-            rop = calculate_reorder_point(item.mean_daily, item.std_daily,
-                                          item.lead_time_days, service, item.distribution)
-            eoq = calculate_eoq(item.mean_daily, order_cost, hold_pct, unit_cost)
+                rop = calculate_reorder_point(item.mean_daily, item.std_daily,
+                                              item.lead_time_days, service, item.distribution)
+                eoq = calculate_eoq(item.mean_daily, order_cost, hold_pct, unit_cost)
 
-            st.subheader("Key Inventory Metrics")
-            st.metric("Reorder Point (ROP)", f"{rop:.1f}")
-            st.metric("EOQ", f"{eoq:.1f}")
-            st.metric("Daily Mean Demand", f"{item.mean_daily:.2f}")
-            st.metric("Daily Std Dev", f"{item.std_daily:.2f}")
+                st.subheader("Key Inventory Metrics")
+                st.metric("Reorder Point (ROP)", f"{rop:.1f}")
+                st.metric("EOQ", f"{eoq:.1f}")
+                st.metric("Daily Mean Demand", f"{item.mean_daily:.2f}")
+                st.metric("Daily Std Dev", f"{item.std_daily:.2f}")
 
-            st.markdown("---")
-            st.subheader("Simulation Results")
+                st.markdown("---")
+                st.subheader("Simulation Results")
 
-            result, history = simulate_inventory_with_real_data(item, rop, eoq)
+                result, history = simulate_inventory_with_real_data(item, rop, eoq)
 
-            colm1, colm2 = st.columns(2)
-            colm1.metric("Avg Inventory (≥0)", f"{result['avg_inventory']:.1f}")
-            colm2.metric("Min Inventory", f"{result['min_inventory']:.1f}")
-            colm3, colm4 = st.columns(2)
-            colm3.metric("Max Inventory", f"{result['max_inventory']:.1f}")
-            colm4.metric("Fill Rate", f"{result['fill_rate']:.1f}%")
-            colm5, colm6 = st.columns(2)
-            colm5.metric("Stockout Days", f"{result['stockout_days']}")
-            colm6.metric("Total Shortage", f"{result['total_shortage']:.1f}")
+                colm1, colm2 = st.columns(2)
+                colm1.metric("Avg Inventory (≥0)", f"{result['avg_inventory']:.1f}")
+                colm2.metric("Min Inventory", f"{result['min_inventory']:.1f}")
+                colm3, colm4 = st.columns(2)
+                colm3.metric("Max Inventory", f"{result['max_inventory']:.1f}")
+                colm4.metric("Fill Rate", f"{result['fill_rate']:.1f}%")
+                colm5, colm6 = st.columns(2)
+                colm5.metric("Stockout Days", f"{result['stockout_days']}")
+                colm6.metric("Total Shortage", f"{result['total_shortage']:.1f}")
 
-    with col_right:
-        if mean_daily <= 0:
-            st.info("Inventory plots will appear here once demand statistics are available.")
-        else:
-            st.subheader("Inventory & Demand Over Time")
+        with col_right:
+            if series_m is None or mean_daily <= 0 or result is None or history is None:
+                st.info("Inventory plots will appear here once demand statistics and simulation are available.")
+            else:
+                st.subheader("Inventory & Demand Over Time")
 
-            days = history["days"]
-            inventory = history["inventory"]
-            demand = history["demand"]
+                days = history["days"]
+                inventory = history["inventory"]
+                demand = history["demand"]
 
-            fig1, ax1 = plt.subplots(figsize=(8, 4))
-            ax1.plot(days, inventory, label="Inventory Level", color="#DC2626", linewidth=1.8)
-            ax1.axhline(0, color="black", linewidth=1, linestyle="--", alpha=0.5)
-            ax1.axhline(rop, color="#16A34A", linestyle="--", linewidth=1.5, label="ROP")
-            ax1.set_xlabel("Day")
-            ax1.set_ylabel("Inventory")
-            ax1.set_title(f"Inventory Trajectory — {code}")
-            ax1.legend()
-            ax1.grid(alpha=0.3)
-            st.pyplot(fig1)
+                fig1, ax1 = plt.subplots(figsize=(8, 4))
+                ax1.plot(days, inventory, label="Inventory Level", color="#DC2626", linewidth=1.8)
+                ax1.axhline(0, color="black", linewidth=1, linestyle="--", alpha=0.5)
+                ax1.axhline(result["reorder_point"], color="#16A34A", linestyle="--", linewidth=1.5, label="ROP")
+                ax1.set_xlabel("Day")
+                ax1.set_ylabel("Inventory")
+                ax1.set_title(f"Inventory Trajectory — {code}")
+                ax1.legend()
+                ax1.grid(alpha=0.3)
+                st.pyplot(fig1)
 
-            fig2, ax2 = plt.subplots(figsize=(8, 3))
-            ax2.plot(days, demand, color="#2563EB", linewidth=1.5)
-            ax2.set_xlabel("Day")
-            ax2.set_ylabel("Demand")
-            ax2.set_title("Daily Demand (Simulated)")
-            ax2.grid(alpha=0.3)
-            st.pyplot(fig2)
+                fig2, ax2 = plt.subplots(figsize=(8, 3))
+                ax2.plot(days, demand, color="#2563EB", linewidth=1.5)
+                ax2.set_xlabel("Day")
+                ax2.set_ylabel("Demand")
+                ax2.set_title("Daily Demand (Simulated)")
+                ax2.grid(alpha=0.3)
+                st.pyplot(fig2)
 
-            fig3, ax3 = plt.subplots(figsize=(8, 3))
-            ax3.hist(demand, bins=30, color="#0EA5E9", alpha=0.8, edgecolor="white")
-            ax3.set_xlabel("Demand")
-            ax3.set_ylabel("Frequency")
-            ax3.set_title("Demand Distribution (Simulated)")
-            st.pyplot(fig3)
+                fig3, ax3 = plt.subplots(figsize=(8, 3))
+                ax3.hist(demand, bins=30, color="#0EA5E9", alpha=0.8, edgecolor="white")
+                ax3.set_xlabel("Demand")
+                ax3.set_ylabel("Frequency")
+                ax3.set_title("Demand Distribution (Simulated)")
+                st.pyplot(fig3)
 
 # -------------------------
 # TAB 5 — TIME SERIES
 # -------------------------
 with tab5:
     st.header("⏳ Time Series")
-    st.line_chart(series_m)
+    if series_m is None:
+        st.info("Time series is not available because no product could be selected.")
+    else:
+        st.line_chart(series_m)
 
 # -------------------------
 # TAB 6 — DASHBOARD
@@ -552,31 +593,38 @@ with tab5:
 with tab6:
     st.header("📋 Dashboard — Summary")
 
-    st.subheader("Product Information")
-    st.write(f"**Code:** {code}")
-    st.write(f"**Description:** {desc}")
+    if series_m is None:
+        st.info("Dashboard is not available because no product could be selected.")
+    else:
+        st.subheader("Product Information")
+        st.write(f"**Code:** {code}")
+        st.write(f"**Description:** {desc}")
 
-    st.subheader("Monthly Demand")
-    st.line_chart(series_m)
+        st.subheader("Monthly Demand")
+        st.line_chart(series_m)
 
-    st.subheader("Forecast Results")
-    if 'fc_arima' in locals() and fc_arima is not None:
-        st.write("ARIMA Forecast")
-        st.line_chart(fc_arima)
+        st.subheader("Forecast Results")
+        if "fc_arima" in locals() and fc_arima is not None:
+            st.write("ARIMA Forecast")
+            st.line_chart(fc_arima)
 
-    if 'preds_xgb' in locals() and preds_xgb is not None:
-        st.write("XGBoost Forecast")
-        st.line_chart(pd.DataFrame({"Actual": y_test_xgb, "Prediction": preds_xgb}))
+        if "preds_xgb" in locals() and preds_xgb is not None:
+            st.write("XGBoost Forecast")
+            st.line_chart(pd.DataFrame({"Actual": y_test_xgb, "Prediction": preds_xgb}))
 
-    if 'preds_cat' in locals() and preds_cat is not None:
-        st.write("CatBoost Forecast")
-        st.line_chart(pd.DataFrame({"Actual": y_test_cat, "Prediction": preds_cat}))
+        if "preds_cat" in locals() and preds_cat is not None:
+            st.write("CatBoost Forecast")
+            st.line_chart(pd.DataFrame({"Actual": y_test_cat, "Prediction": preds_cat}))
 
-    if mean_daily > 0:
+        mean_monthly = series_m.mean()
+        std_monthly = series_m.std()
+        mean_daily = mean_monthly / 30 if mean_monthly > 0 else 0.0
+        std_daily = std_monthly / 30 if std_monthly > 0 else 0.0
+
         st.subheader("Inventory Metrics Snapshot")
         st.metric("Daily Mean Demand", f"{mean_daily:.2f}")
         st.metric("Daily Std Dev", f"{std_daily:.2f}")
-        st.metric("Service Level", f"{SERVICE_LEVEL*100:.0f}%")
+        st.metric("Default Service Level", f"{SERVICE_LEVEL*100:.0f}%")
 
 # -------------------------
 # TAB 7 — INFO
@@ -586,7 +634,7 @@ with tab7:
     st.markdown("""
 This integrated DSS includes:
 - EDA
-- ABC–XYZ classification
+- ABC–XYZ classification (with color-coded matrix)
 - Forecasting (ARIMA, XGBoost, CatBoost)
 - Simulation-based inventory optimization (ROP, EOQ, stockouts, fill rate)
 - Time series visualization
