@@ -359,9 +359,9 @@ def color_abc_xyz(val):
 # =============================================================================
 
 st.set_page_config(page_title="DSS", layout="wide")
-st.title("Integrated Decision Support System")
+st.title("📦 Integrated Decision Support System"")
 
-st.header("Data Upload")
+st.header("1️⃣ Data Upload")
 uploaded = st.file_uploader("Upload Excel (xlsx/xls) or CSV", type=["xlsx","xls","csv"])
 
 if uploaded is None:
@@ -377,14 +377,14 @@ df = clean_raw(df)
 st.success("Data successfully loaded!")
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["EDA", "ABC-XYZ", "Forecast", "Inventory", "Time Series", "Dashboard", "Info"]
+    ["📊 EDA", "🧮 ABC–XYZ", "📈 Forecast", "📦 Inventory", "⏳ Time Series", "📋 Dashboard", "ℹ Info"]
 )
 
 # -------------------------
 # TAB 1 — EDA
 # -------------------------
 with tab1:
-    st.header("Exploratory Data Analysis")
+    st.header("📊 Exploratory Data Analysis")
     st.write(df.head())
     st.write("Total records:", len(df))
 
@@ -409,7 +409,7 @@ else:
 # TAB 2 — ABC–XYZ
 # -------------------------
 with tab2:
-    st.header("ABC-XYZ Analysis")
+    st.header("🧮 ABC–XYZ Analysis")
 
     if not monthly:
         st.info("ABC-XYZ analysis is not available because monthly data is insufficient.")
@@ -450,7 +450,7 @@ with tab2:
 # TAB 3 — FORECAST
 # -------------------------
 with tab3:
-    st.header("Forecasting Models")
+    st.header("📈 Forecasting Models")
 
     if series_m is None:
         st.info("Forecasting is not available because no product could be selected.")
@@ -487,7 +487,7 @@ with tab3:
 # TAB 4 — INVENTORY (SPLIT LAYOUT)
 # -------------------------
 with tab4:
-    st.header("Inventory Optimization - Simulation Based")
+    st.header("📦 Inventory Optimization — Simulation Based")
 
     if series_m is None:
         st.info("Inventory optimization is not available because no product could be selected.")
@@ -591,7 +591,7 @@ with tab4:
 # TAB 5 — TIME SERIES
 # -------------------------
 with tab5:
-    st.header("Time Series")
+    st.header("⏳ Time Series")
     if series_m is None:
         st.info("Time series is not available because no product could be selected.")
     else:
@@ -601,7 +601,7 @@ with tab5:
 # TAB 6 — DASHBOARD
 # -------------------------
 with tab6:
-    st.header("Dashboard - Summary")
+    st.header("📋 Dashboard — Summary")
 
     if series_m is None:
         st.info("Dashboard is not available because no product could be selected.")
@@ -640,7 +640,7 @@ with tab6:
 # TAB 7 — INFO
 # -------------------------
 with tab7:
-    st.header("Info")
+    st.header("ℹ Info")
     st.markdown("""
 This integrated DSS includes:
 - EDA
