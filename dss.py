@@ -122,7 +122,27 @@ def ml_forecast(series, model_type="xgboost"):
 # =============================================================================
 # 4. ABC – XYZ ANALYSIS
 # =============================================================================
+def color_abc_xyz(val):
+    # ABC renkleri
+    abc_colors = {
+        "A": "#4CAF50",   # yeşil
+        "B": "#FFC107",   # sarı
+        "C": "#F44336"    # kırmızı
+    }
 
+    # XYZ renkleri
+    xyz_colors = {
+        "X": "#4CAF50",   # yeşil
+        "Y": "#FFC107",   # sarı
+        "Z": "#F44336"    # kırmızı
+    }
+
+    if val in abc_colors:
+        return f"background-color: {abc_colors[val]}; color: white; font-weight: bold;"
+    if val in xyz_colors:
+        return f"background-color: {xyz_colors[val]}; color: white; font-weight: bold;"
+    return ""
+    
 def abc_analysis(monthly_dict):
     records = []
     for (code, desc), series in monthly_dict.items():
@@ -163,6 +183,15 @@ def xyz_analysis(monthly_dict):
 
     df = pd.DataFrame(records, columns=["Material", "Description", "Mean", "Std", "CV", "XYZ"])
     return df
+
+st.subheader("ABC–XYZ Matrix")
+
+merged = df_abc.merge(df_xyz[["Material", "XYZ"]], on="Material")
+merged["ABC_XYZ"] = merged["ABC"] + merged["XYZ"]
+
+styled = merged.style.applymap(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
+
+st.dataframe(styled, use_container_width=True)
 
 # =============================================================================
 # 5. INVENTORY OPTIMIZATION
