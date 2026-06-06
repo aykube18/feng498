@@ -308,7 +308,7 @@ df = clean_raw(raw_data)
 st.success("Data successfully optimized and structural mapping completed!")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 EDA", "🧮 ABC–XYZ", "📈 Forecaste", 
+    "📊 EDA", "🧮 ABC–XYZ", "📈 Forecast", 
     "📦 Inventory", "⏳ Time Series", "📋 Summary Dashboard"
 ])
 
