@@ -15,12 +15,12 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 warnings.filterwarnings("ignore")
 
 # =============================================================================
-# CONSTANTS & CONFIGURATIONS
+# CONSTANTS & CONFIGURATIONS (VERİ TİPLERİ FLOAT OLARAK SABİTLENDİ)
 # =============================================================================
 ORDERING_COST = 2792.0       # TRY - Fixed ordering cost
 HOLDING_COST_PCT = 0.25      # 25% - Annual holding cost percentage
 SERVICE_LEVEL = 0.95         # 95% service level
-STOCKOUT_COST_PER_UNIT = 150 # TRY - Cost per unit of stockout
+STOCKOUT_COST_PER_UNIT = 150.0 # TRY - Cost per unit of stockout (Hata önleyici float)
 
 SHORT_NAMES = {
     600080: "MOTORIN", 600096: "TOKA 32", 600102: "ÇEMBER TOKA",
@@ -37,14 +37,12 @@ def load_file(uploaded_file):
     if uploaded_file.name.endswith(".csv"):
         return pd.read_csv(uploaded_file)
     else:
-        # Sheet ismi malzeme kodu olabilir veya varsayılan ilk sheet yüklenebilir
         try:
             return pd.read_excel(uploaded_file, sheet_name=0)
         except Exception:
             return pd.read_excel(uploaded_file)
 
 def clean_raw(df):
-    # Standart eski şablon ve yeni ForecastEOQ şablonu için esnek sütun eşleme
     rename_map = {
         "Malzeme": "Material", "Malzeme kısa metni": "Description",
         "Hareket türleri metni": "MovementType", "Kayıt tarihi": "Date",
@@ -58,12 +56,12 @@ def clean_raw(df):
         df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
     
     if "Quantity" in df.columns:
-        df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
+        df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0.0)
     else:
         df["Quantity"] = 0.0
         
     if "Inflow" in df.columns:
-        df["Inflow"] = pd.to_numeric(df["Inflow"], errors="coerce").fillna(0)
+        df["Inflow"] = pd.to_numeric(df["Inflow"], errors="coerce").fillna(0.0)
     else:
         df["Inflow"] = 0.0
 
@@ -84,7 +82,7 @@ def get_monthly(df):
         return result
     for (code, desc), grp in df.groupby(["Material", "Description"]):
         m = grp.set_index("Date")["Quantity"].resample("MS").sum()
-        if len(m) < 2:  # Esneklik için sınır düşürüldü
+        if len(m) < 2:
             continue
         full = pd.date_range(start=m.index.min(), end=m.index.max(), freq="MS")
         m = m.reindex(full, fill_value=0)
@@ -105,11 +103,10 @@ def get_weekly(df):
     return result
 
 # =============================================================================
-# 3. ADVANCED FORECAST LOGIC (FROM YENI_FORECAST_BÖLÜMÜ)
+# 3. ADVANCED FORECAST LOGIC
 # =============================================================================
 def run_sarima_grid(train_series, test_series, m=7):
     best_aic, best_order, best_seasonal = np.inf, (1, 1, 1), (1, 1, 0, m)
-    # Performans için optimize edilmiş kombinasyon seti
     combos = list(itertools.product(range(2), range(2), range(2), range(2), range(2), range(2)))
     for p, d, q, P, D, Q in combos:
         if p == 0 and q == 0 and P == 0 and Q == 0:
@@ -127,7 +124,7 @@ def run_sarima_grid(train_series, test_series, m=7):
         fc = pd.Series(fitted.forecast(steps=len(test_series)).values, index=test_series.index).clip(lower=0)
         return fc, f"SARIMA{best_order}{best_seasonal}"
     except Exception:
-        return pd.Series(0, index=test_series.index), "SARIMA Fallback"
+        return pd.Series(0.0, index=test_series.index), "SARIMA Fallback"
 
 def make_ml_features(series, lags=14, rolling_windows=[7, 14, 30]):
     df = pd.DataFrame({'y': series})
@@ -163,7 +160,7 @@ def recursive_forecast(model, train_series, test_index, feature_cols, lags=14):
 def run_ml_forecast(train_series, test_series, model_type="xgboost"):
     df_train = make_ml_features(train_series)
     if df_train.empty:
-        return pd.Series(0, index=test_series.index)
+        return pd.Series(0.0, index=test_series.index)
     
     feature_cols = [c for c in df_train.columns if c != 'y']
     
@@ -212,7 +209,7 @@ def xyz_analysis(monthly_dict):
     return pd.DataFrame(records, columns=["Material", "Description", "Mean", "Std", "CV", "XYZ"])
 
 # =============================================================================
-# 5. ADVANCED INVENTORY LOGIC (FROM YENI_ENVANTER_BÖLÜMÜ)
+# 5. ADVANCED INVENTORY LOGIC
 # =============================================================================
 def calculate_real_inventory(df):
     df = df.copy()
@@ -226,9 +223,9 @@ def calculate_real_inventory(df):
         current_inv = current_inv + row["Inflow"] - row["Quantity"]
         if current_inv < 0:
             stockout_list.append(-current_inv)
-            current_inv = 0
+            current_inv = 0.0
         else:
-            stockout_list.append(0)
+            stockout_list.append(0.0)
         inventory_list.append(current_inv)
 
     df["Envanter"] = inventory_list
@@ -237,10 +234,10 @@ def calculate_real_inventory(df):
 
 def calculate_real_inventory_costs(df, unit_price, order_cost, hold_pct, stockout_cost):
     df = df.copy()
-    daily_holding_cost_rate = hold_pct / 365
+    daily_holding_cost_rate = hold_pct / 365.0
     df["Holding_Cost_Daily"] = df["Envanter"] * daily_holding_cost_rate * unit_price
     df["Is_Order"] = df["Inflow"] > 0
-    df["Ordering_Cost_Daily"] = df["Is_Order"] * order_cost
+    df["Ordering_Cost_Daily"] = df["Is_Order"].astype(float) * order_cost
     df["Stockout_Cost_Daily"] = df["Stockout"] * stockout_cost
     df["Total_Cost_Daily"] = df["Holding_Cost_Daily"] + df["Ordering_Cost_Daily"] + df["Stockout_Cost_Daily"]
     return df
@@ -256,13 +253,13 @@ def calculate_eoq_rop_stats(df, unit_price, order_cost, hold_pct, service_level,
     std_daily = std_consumption / np.sqrt(days) if days > 1 else avg_daily_consumption * 0.3
     cv = (std_daily / avg_daily_consumption * 100) if avg_daily_consumption > 0 else 0
 
-    annual_demand = avg_daily_consumption * 365
+    annual_demand = avg_daily_consumption * 365.0
     holding_cost_val = hold_pct * unit_price
 
     if annual_demand > 0 and holding_cost_val > 0:
-        eoq = math.sqrt((2 * annual_demand * order_cost) / holding_cost_val)
+        eoq = math.sqrt((2.0 * annual_demand * order_cost) / holding_cost_val)
     else:
-        eoq = avg_daily_consumption * 30
+        eoq = avg_daily_consumption * 30.0
     eoq = max(1.0, eoq)
 
     lt_mean = avg_daily_consumption * lead_time_days
@@ -320,7 +317,6 @@ with tab1:
     st.dataframe(df.head(10))
     st.metric("Total Row Records", f"{len(df):,}")
 
-# Generate series for dropdowns
 monthly = get_monthly(df)
 if not monthly:
     st.warning("Insufficient data available to classify historical steps or draw time steps.")
@@ -331,13 +327,10 @@ selected_product = st.sidebar.selectbox("🎯 Target Product Selection", items_l
 selected_key = list(monthly.keys())[items_list.index(selected_product)]
 p_code, p_desc = selected_key
 
-# Filter product specific daily records for inventory/forecasting
 product_df = df[(df["Material"] == p_code) & (df["Description"] == p_desc)].copy()
 if product_df.empty:
-    # Fallback to general indexing if structural mapping differs
     product_df = df.copy()
 
-# Ensure full date index for daily data continuity
 product_df = product_df.set_index("Date")
 full_daily_range = pd.date_range(start=product_df.index.min(), end=product_df.index.max(), freq='D')
 product_df = product_df.reindex(full_daily_range).fillna({"Quantity": 0.0, "Inflow": 0.0, "Material": p_code, "Description": p_desc})
@@ -370,7 +363,7 @@ with tab2:
     st.markdown(styled.to_html(), unsafe_allow_html=True)
 
 # =============================================================================
-# TAB 3 — ADVANCED FORECASTING (SARIMA + XGB + CAT)
+# TAB 3 — ADVANCED FORECASTING
 # =============================================================================
 with tab3:
     st.header("📈 High-Fidelity Forecast Model Projections (Daily)")
@@ -396,7 +389,6 @@ with tab3:
         m_xgb = calculate_metrics(test_seq, fc_xgb)
         m_cat = calculate_metrics(test_seq, fc_cat)
         
-        # Display summary table
         metrics_df = pd.DataFrame({
             "Model Pipeline": [sarima_name, "XGBoost Regressor", "CatBoost Regressor"],
             "MAE": [m_sarima[0], m_xgb[0], m_cat[0]],
@@ -405,11 +397,9 @@ with tab3:
         })
         st.table(metrics_df)
         
-        # Combined Chart Plot
         fig, ax = plt.subplots(figsize=(14, 5.5))
         ax.plot(daily_series.index, daily_series.values, color='#1a6faf', alpha=0.6, label='Actual Historical Demand')
         
-        # Concat last step of train to allow visual continuity
         last_step = train_seq.iloc[[-1]]
         ax.plot(pd.concat([last_step, fc_sarima]).index, pd.concat([last_step, fc_sarima]).values, color='#e53935', linestyle='--', label='SARIMA Predict')
         ax.plot(pd.concat([last_step, fc_xgb]).index, pd.concat([last_step, fc_xgb]).values, color='#43a047', linestyle='-.', label='XGBoost Predict')
@@ -425,27 +415,55 @@ with tab3:
         plt.close()
 
 # =============================================================================
-# TAB 4 — REAL COSTS & INVENTORY OPTIMIZATION
+# TAB 4 — REAL COSTS & INVENTORY OPTIMIZATION (HATA DÜZELTİLMİŞ KESİN TIP ATAMALARI)
 # =============================================================================
 with tab4:
     st.header("💸 Real Material Flows, Costs & Stockout Matrix")
     
     col_p1, col_p2 = st.columns(2)
     with col_p1:
-        ui_unit_price = st.number_input("Unit Price (Material Base Cost)", min_value=0.1, max_value=50000.0, value=10.0, step=1.0)
-        ui_order_cost = st.number_input("Ordering Setup Cost (Fixed)", min_value=1.0, max_value=100000.0, value=ORDERING_COST, step=10.0)
+        ui_unit_price = st.number_input(
+            "Unit Price (Material Base Cost)", 
+            min_value=0.1, 
+            max_value=50000.0, 
+            value=10.0, 
+            step=1.0
+        )
+        ui_order_cost = st.number_input(
+            "Ordering Setup Cost (Fixed)", 
+            min_value=1.0, 
+            max_value=100000.0, 
+            value=float(ORDERING_COST), 
+            step=10.0
+        )
     with col_p2:
-        ui_hold_pct = st.slider("Holding Cost Rate (Annualized %)", 0.01, 1.0, HOLDING_COST_PCT, step=0.01)
-        ui_stockout_cost = st.number_input("Penalty/Stockout Cost Per Unit Shortage", min_value=0.0, max_value=5000.0, value=STOCKOUT_COST_PER_UNIT)
+        ui_hold_pct = st.slider(
+            "Holding Cost Rate (Annualized %)", 
+            min_value=0.01, 
+            max_value=1.0, 
+            value=float(HOLDING_COST_PCT), 
+            step=0.01
+        )
+        ui_stockout_cost = st.number_input(
+            "Penalty/Stockout Cost Per Unit Shortage", 
+            min_value=0.0, 
+            max_value=5000.0, 
+            value=float(STOCKOUT_COST_PER_UNIT),
+            step=1.0
+        )
         
-    ui_lead_time = st.number_input("Lead Time Duration (Days)", min_value=1, max_value=90, value=7)
+    ui_lead_time = st.number_input(
+        "Lead Time Duration (Days)", 
+        min_value=1, 
+        max_value=90, 
+        value=int(7),
+        step=1
+    )
     
-    # Calculation Engine Execution
     calculated_df = calculate_real_inventory(product_df)
     cost_df = calculate_real_inventory_costs(calculated_df, ui_unit_price, ui_order_cost, ui_hold_pct, ui_stockout_cost)
     inv_stats = calculate_eoq_rop_stats(cost_df, ui_unit_price, ui_order_cost, ui_hold_pct, SERVICE_LEVEL, ui_lead_time)
     
-    # Financial metrics summaries
     total_h = cost_df["Holding_Cost_Daily"].sum()
     total_o = cost_df["Ordering_Cost_Daily"].sum()
     total_s = cost_df["Stockout_Cost_Daily"].sum()
@@ -471,7 +489,6 @@ with tab4:
         st.metric("Average Daily Sales Demand", f"{inv_stats['avg_daily_consumption']:.2f} Units")
         st.metric("Stockout Occurrence Days", f"{(cost_df['Stockout'] > 0).sum()} Days")
         
-    # Visual Saw-Tooth and Stacked Cost Distribution Profiles
     st.subheader("Real Inventory Balance & Safety Bands Over Time")
     fig_st, ax_st = plt.subplots(figsize=(14, 4.5))
     days_arr = range(len(cost_df))
