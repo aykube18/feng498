@@ -290,7 +290,7 @@ def color_abc_xyz(val):
 # 7. STREAMLIT UI ENTRY
 # =============================================================================
 st.set_page_config(page_title="DSS Pro", layout="wide")
-st.title("📦 Integrated Decision Support System (Advanced Model)")
+st.title("📦 Integrated Decision Support System")
 
 st.header("1️⃣ Data Upload")
 uploaded = st.file_uploader("Upload Excel (xlsx/xls) or CSV File", type=["xlsx","xls","csv"])
@@ -308,8 +308,8 @@ df = clean_raw(raw_data)
 st.success("Data successfully optimized and structural mapping completed!")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 EDA & Data Sample", "🧮 ABC–XYZ Matrix", "📈 Advanced Forecasting", 
-    "💸 Real Cost & Inventory", "⏳ Daily Time Series", "📋 Summary Dashboard"
+    "📊 EDA", "🧮 ABC–XYZ", "📈 Forecaste", 
+    "📦 Inventory", "⏳ Time Series", "📋 Summary Dashboard"
 ])
 
 with tab1:
