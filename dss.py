@@ -366,7 +366,7 @@ with tab2:
 # TAB 3 — ADVANCED FORECASTING
 # =============================================================================
 with tab3:
-    st.header("📈 High-Fidelity Forecast Model Projections (Daily)")
+    st.header("📈 Forecast Models")
     
     daily_series = product_df.set_index("Date")["Quantity"]
     n_days = len(daily_series)
@@ -418,7 +418,7 @@ with tab3:
 # TAB 4 — REAL COSTS & INVENTORY OPTIMIZATION (HATA DÜZELTİLMİŞ KESİN TIP ATAMALARI)
 # =============================================================================
 with tab4:
-    st.header("💸 Real Material Flows, Costs & Stockout Matrix")
+    st.header("💸 Material Flows, Costs & Stockout Matrix")
     
     col_p1, col_p2 = st.columns(2)
     with col_p1:
