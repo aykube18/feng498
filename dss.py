@@ -115,7 +115,7 @@ def get_weekly(df):
     return result
 
 # =============================================================================
-# 3. ROLLING ONE-STEP ADVANCED FORECAST MECHANISMS (UPDATED DETECTOR)
+# 3. ROLLING ONE-STEP ADVANCED FORECAST MECHANISMS
 # =============================================================================
 def _aicc(result) -> float:
     k = len(result.params)
@@ -218,6 +218,20 @@ def error_stats(actual, pred):
     mask = actual != 0
     mape = float(np.mean(np.abs(err[mask] / actual[mask])) * 100.0) if mask.any() else np.nan
     return mae, rmse, mape
+
+# DETECTED FIX: Added missing structural alignment frame function
+def build_comparison(test, sarima_pred, lo, hi, xgb_pred, cat_pred) -> pd.DataFrame:
+    out = pd.DataFrame({
+        "date": test["Date"].values,
+        "t": test["t"].values,
+        "Actual": test[VALUE_COL].values.astype(float),
+        "SARIMA": sarima_pred,
+        "SARIMA_Lo95": lo,
+        "SARIMA_Hi95": hi,
+        "XGBoost": xgb_pred,
+        "CatBoost": cat_pred,
+    })
+    return out
 
 # =============================================================================
 # 4. ABC – XYZ MATERIAL ANALYSIS
@@ -403,7 +417,7 @@ with tab2:
     st.markdown(styled.to_html(), unsafe_allow_html=True)
 
 # =============================================================================
-# TAB 3 — ADVANCED FORECASTING (INTEGRATED NEW ROLLING ONE-STEP ENGINE)
+# TAB 3 — ADVANCED FORECASTING
 # =============================================================================
 with tab3:
     st.header("📈 High-Fidelity Rolling 1-Step Forecast Engine (Daily)")
