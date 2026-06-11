@@ -456,12 +456,11 @@ with tab2:
 # TAB 3 — ADVANCED FORECASTING
 # =============================================================================
 with tab3:
-    st.header("📈 High-Fidelity Rolling 1-Step Forecast Engine (Daily)")
+    st.header("📈 Forecast Engine")
     if not has_valid_forecast:
         st.warning(f"Data configuration criteria not met for forecast loops.")
     else:
-        st.write(f"**Execution Profile:** Training Days: `{len(train_frame)}` | Testing Days Evaluation Window: `{len(test_frame)}`")
-        st.info(f"🏆 **Automated Model Selector:** **{best_model_name}** has the lowest MAE error profile. Its parameters are dispatched to feed the Inventory matrix step seamlessly.")
+        st.info(f"🏆 **Automated Model Selector:** **{best_model_name}** has the lowest MAE error profile.")
         
         accuracy_df = pd.DataFrame({
             "Model Specification": [f"SARIMA{order}{sorder[:3]} s={sorder[3]}", "XGBoost Regressor", "CatBoost Regressor"],
