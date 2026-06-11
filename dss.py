@@ -421,7 +421,7 @@ if len(train_frame) >= N_LAGS and len(test_frame) > 0:
 # UI Tabs Mapping
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 EDA ", "🧮 ABC–XYZ", "📈 Forecast", 
-    "📦 Inventory", "⏳ Time Series", "📋 Dashboard"
+    "📦 Inventory", "⏳ Time Series", "📋 Summary Dashboard"
 ])
 
 with tab1:
