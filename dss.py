@@ -3,9 +3,9 @@ import pandas as pd
 import numpy as np
 import warnings
 import math
+import itertools
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import itertools
 from scipy import stats
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from xgboost import XGBRegressor
@@ -15,12 +15,24 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 warnings.filterwarnings("ignore")
 
 # =============================================================================
-# CONSTANTS & CONFIGURATIONS (VERİ TİPLERİ FLOAT OLARAK SABİTLENDİ)
+# CONSTANTS & CONFIGURATIONS
 # =============================================================================
-ORDERING_COST = 2792.0       # TRY - Fixed ordering cost
-HOLDING_COST_PCT = 0.25      # 25% - Annual holding cost percentage
-SERVICE_LEVEL = 0.95         # 95% service level
-STOCKOUT_COST_PER_UNIT = 150.0 # TRY - Cost per unit of stockout (Hata önleyici float)
+ORDERING_COST = 2792.0       
+HOLDING_COST_PCT = 0.25      
+SERVICE_LEVEL = 0.95         
+STOCKOUT_COST_PER_UNIT = 150.0 
+
+# Forecast Configuration Constraints
+DATE_COL = "Date"
+VALUE_COL = "Quantity"
+TEST_START = "2025-04-02"          
+SEASONAL = 7                       
+DEFAULT_ORDER = (1, 1, 2)       
+DEFAULT_SORDER = (1, 1, 1, SEASONAL)
+ALPHA = 0.05                       
+AUTO_SELECT = False                
+N_LAGS = 14
+ROLL_WINDOWS = (7, 14, 30)
 
 SHORT_NAMES = {
     600080: "MOTORIN", 600096: "TOKA 32", 600102: "ÇEMBER TOKA",
@@ -29,7 +41,7 @@ SHORT_NAMES = {
 }
 
 # =============================================================================
-# 1. DATA LOADING & CLEANING
+# 1. DATA LOADING & STRUCTURAL INTEGRATION
 # =============================================================================
 def load_file(uploaded_file):
     if uploaded_file is None:
@@ -47,7 +59,7 @@ def clean_raw(df):
         "Malzeme": "Material", "Malzeme kısa metni": "Description",
         "Hareket türleri metni": "MovementType", "Kayıt tarihi": "Date",
         "Miktar Abs": "Quantity", "Temel ölçü birimi": "Unit", "WhichDepo?": "Warehouse",
-        "Tarih": "Date", "Tüketim Miktarı": "Quantity", "Mal Giriş": "Inflow"
+        "Tarih": "Date", "Tüketim Miktarı": "Quantity", "Mal Giriş": "Inflow", "Tüketim": "Quantity"
     }
     df = df.rename(columns=rename_map)
     
@@ -74,7 +86,7 @@ def clean_raw(df):
     return df
 
 # =============================================================================
-# 2. AGGREGATION FUNCTIONS
+# 2. SECTORAL AGGREGATION PIPELINES
 # =============================================================================
 def get_monthly(df):
     result = {}
@@ -103,83 +115,112 @@ def get_weekly(df):
     return result
 
 # =============================================================================
-# 3. ADVANCED FORECAST LOGIC
+# 3. ROLLING ONE-STEP ADVANCED FORECAST MECHANISMS (UPDATED DETECTOR)
 # =============================================================================
-def run_sarima_grid(train_series, test_series, m=7):
-    best_aic, best_order, best_seasonal = np.inf, (1, 1, 1), (1, 1, 0, m)
-    combos = list(itertools.product(range(2), range(2), range(2), range(2), range(2), range(2)))
-    for p, d, q, P, D, Q in combos:
-        if p == 0 and q == 0 and P == 0 and Q == 0:
-            continue
-        try:
-            res = SARIMAX(train_series, order=(p, d, q), seasonal_order=(P, D, Q, m),
-                          enforce_stationarity=False, enforce_invertibility=False).fit(disp=False, maxiter=20)
-            if res.aic < best_aic:
-                best_aic, best_order, best_seasonal = res.aic, (p, d, q), (P, D, Q, m)
-        except Exception:
-            continue
-    try:
-        fitted = SARIMAX(train_series, order=best_order, seasonal_order=best_seasonal,
-                         enforce_stationarity=False, enforce_invertibility=False).fit(disp=False, maxiter=50)
-        fc = pd.Series(fitted.forecast(steps=len(test_series)).values, index=test_series.index).clip(lower=0)
-        return fc, f"SARIMA{best_order}{best_seasonal}"
-    except Exception:
-        return pd.Series(0.0, index=test_series.index), "SARIMA Fallback"
+def _aicc(result) -> float:
+    k = len(result.params)
+    n = result.nobs
+    return result.aic + (2 * k * k + 2 * k) / (n - k - 1) if (n - k - 1) > 0 else np.inf
 
-def make_ml_features(series, lags=14, rolling_windows=[7, 14, 30]):
-    df = pd.DataFrame({'y': series})
-    for lag in range(1, lags + 1):
-        df[f'lag_{lag}'] = df['y'].shift(lag)
-    for w in rolling_windows:
-        df[f'rolling_mean_{w}'] = df['y'].shift(1).rolling(w).mean()
-        df[f'rolling_std_{w}']  = df['y'].shift(1).rolling(w).std()
-    df['dayofweek'] = series.index.dayofweek
-    df['day']       = series.index.day
-    df['month']     = series.index.month
-    df['dow_sin']   = np.sin(2 * np.pi * df['dayofweek'] / 7)
-    df['dow_cos']   = np.cos(2 * np.pi * df['dayofweek'] / 7)
-    df['trend']     = np.arange(len(series))
-    return df.dropna()
+def select_order_aicc(y: pd.Series):
+    best = {"score": np.inf, "order": DEFAULT_ORDER, "sorder": DEFAULT_SORDER}
+    for p, d, q in itertools.product(range(3), range(2), range(3)):
+        for P, D, Q in itertools.product(range(2), range(2), range(2)):
+            try:
+                res = SARIMAX(y, order=(p, d, q), seasonal_order=(P, D, Q, SEASONAL),
+                              enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+                score = _aicc(res)
+                if np.isfinite(score) and score < best["score"]:
+                    best = {"score": score, "order": (p, d, q), "sorder": (P, D, Q, SEASONAL)}
+            except Exception:
+                continue
+    return best["order"], best["sorder"]
 
-def recursive_forecast(model, train_series, test_index, feature_cols, lags=14):
-    history = list(train_series.values)
-    history_idx = list(train_series.index)
+def rolling_one_step_sarima(y_train: pd.Series, test_values: np.ndarray, order, sorder):
+    res = SARIMAX(y_train, order=order, seasonal_order=sorder,
+                  enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    hist = res
+    pred = np.empty(len(test_values))
+    lo = np.empty(len(test_values))
+    hi = np.empty(len(test_values))
+    for i, actual in enumerate(test_values):
+        fc = hist.get_forecast(steps=1)
+        pred[i] = float(fc.predicted_mean.iloc[0])
+        ci = np.asarray(fc.conf_int(alpha=ALPHA))[0]
+        lo[i], hi[i] = ci[0], ci[1]
+        hist = hist.append([actual], refit=False)
+    return np.maximum(pred, 0.0), np.maximum(lo, 0.0), np.maximum(hi, 0.0)
+
+def make_feature_row(history_values, idx_date, t_value):
+    h = np.asarray(history_values, dtype=float)
+    feat = {}
+    for lag in range(1, N_LAGS + 1):
+        feat[f"lag_{lag}"] = h[-lag] if len(h) >= lag else 0.0
+    for w in ROLL_WINDOWS:
+        window = h[-w:] if len(h) >= 1 else np.array([0.0])
+        feat[f"rmean_{w}"] = float(np.mean(window)) if len(window) else 0.0
+        feat[f"rstd_{w}"]  = float(np.std(window))  if len(window) > 1 else 0.0
+    
+    dow = idx_date.dayofweek
+    feat["dow"]       = dow
+    feat["dow_sin"]   = np.sin(2 * np.pi * dow / 7.0)
+    feat["dow_cos"]   = np.cos(2 * np.pi * dow / 7.0)
+    feat["month"]     = idx_date.month
+    feat["month_sin"] = np.sin(2 * np.pi * idx_date.month / 12.0)
+    feat["month_cos"] = np.cos(2 * np.pi * idx_date.month / 12.0)
+    feat["trend"]     = t_value
+    return feat
+
+def build_training_matrix(train_frame):
+    values = train_frame[VALUE_COL].values.astype(float)
+    dates  = train_frame["Date"].values
+    ts     = train_frame["t"].values
+    rows, targets = [], []
+    for i in range(N_LAGS, len(values)):
+        hist = values[:i]
+        feat = make_feature_row(hist, pd.Timestamp(dates[i]), int(ts[i]))
+        rows.append(feat)
+        targets.append(values[i])
+    X = pd.DataFrame(rows)
+    y = np.asarray(targets, dtype=float)
+    return X, y, list(X.columns)
+
+def rolling_one_step_ml(model, train_frame, test_frame, feature_cols):
+    history = list(train_frame[VALUE_COL].values.astype(float))
     preds = []
-    for i in range(len(test_index)):
-        temp = pd.Series(history, index=history_idx)
-        temp_df = make_ml_features(temp, lags=lags)
-        if temp_df.empty:
-            preds.append(0.0)
-        else:
-            pred = max(0.0, float(model.predict(temp_df[feature_cols].iloc[[-1]])[0]))
-            preds.append(pred)
-        history.append(preds[-1])
-        history_idx.append(test_index[i])
-    return pd.Series(preds, index=test_index)
+    for _, row in test_frame.iterrows():
+        feat = make_feature_row(history, pd.Timestamp(row["Date"]), int(row["t"]))
+        x = pd.DataFrame([feat])[feature_cols]
+        yhat = max(0.0, float(model.predict(x)[0]))
+        preds.append(yhat)
+        history.append(float(row[VALUE_COL]))
+    return np.asarray(preds)
 
-def run_ml_forecast(train_series, test_series, model_type="xgboost"):
-    df_train = make_ml_features(train_series)
-    if df_train.empty:
-        return pd.Series(0.0, index=test_series.index)
-    
-    feature_cols = [c for c in df_train.columns if c != 'y']
-    
-    if model_type == "xgboost":
-        model = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=4, random_state=42, verbosity=0)
-    else:
-        model = CatBoostRegressor(iterations=300, learning_rate=0.05, depth=4, random_seed=42, verbose=0)
-        
-    model.fit(df_train[feature_cols], df_train['y'], verbose=False)
-    return recursive_forecast(model, train_series, test_series.index, feature_cols)
+def fit_xgboost(X, y):
+    model = XGBRegressor(n_estimators=600, learning_rate=0.03, max_depth=4,
+                         subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
+                         reg_alpha=0.1, reg_lambda=1.0, random_state=42, verbosity=0)
+    model.fit(X, y, verbose=False)
+    return model
 
-def calculate_metrics(actual, forecast):
-    mae = mean_absolute_error(actual, forecast)
-    rmse = np.sqrt(mean_squared_error(actual, forecast))
-    mape = np.mean(np.abs((actual.values - forecast.values) / np.where(actual.values == 0, 1, actual.values))) * 100
+def fit_catboost(X, y):
+    model = CatBoostRegressor(iterations=600, learning_rate=0.03, depth=4,
+                               l2_leaf_reg=3, subsample=0.8, random_seed=42, verbose=0)
+    model.fit(X, y)
+    return model
+
+def error_stats(actual, pred):
+    actual = np.asarray(actual, dtype=float)
+    pred   = np.asarray(pred, dtype=float)
+    err  = actual - pred
+    mae  = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mask = actual != 0
+    mape = float(np.mean(np.abs(err[mask] / actual[mask])) * 100.0) if mask.any() else np.nan
     return mae, rmse, mape
 
 # =============================================================================
-# 4. ABC – XYZ ANALYSIS
+# 4. ABC – XYZ MATERIAL ANALYSIS
 # =============================================================================
 def abc_analysis(monthly_dict):
     records = []
@@ -209,7 +250,7 @@ def xyz_analysis(monthly_dict):
     return pd.DataFrame(records, columns=["Material", "Description", "Mean", "Std", "CV", "XYZ"])
 
 # =============================================================================
-# 5. ADVANCED INVENTORY LOGIC
+# 5. INVENTORY ENGINE MATRIX LOGIC
 # =============================================================================
 def calculate_real_inventory(df):
     df = df.copy()
@@ -276,9 +317,6 @@ def calculate_eoq_rop_stats(df, unit_price, order_cost, hold_pct, service_level,
         "annual_demand": annual_demand
     }
 
-# =============================================================================
-# 6. STYLING FUNCTION FOR MATRIX
-# =============================================================================
 def color_abc_xyz(val):
     colors = {"A": "#4CAF50", "B": "#FFC107", "C": "#F44336",
               "X": "#4CAF50", "Y": "#FFC107", "Z": "#F44336"}
@@ -287,7 +325,7 @@ def color_abc_xyz(val):
     return ""
 
 # =============================================================================
-# 7. STREAMLIT UI ENTRY
+# 6. STREAMLIT UI FRAMEWORK ORCHESTRATION
 # =============================================================================
 st.set_page_config(page_title="DSS Pro", layout="wide")
 st.title("📦 Integrated Decision Support System")
@@ -296,30 +334,30 @@ st.header("1️⃣ Data Upload")
 uploaded = st.file_uploader("Upload Excel (xlsx/xls) or CSV File", type=["xlsx","xls","csv"])
 
 if uploaded is None:
-    st.info("Please upload a data file to activate the dashboard system.")
+    st.info("Please upload a transactional logging file to launch dashboards.")
     st.stop()
 
 raw_data = load_file(uploaded)
 if raw_data is None or raw_data.empty:
-    st.error("The uploaded file is empty or missing necessary columns.")
+    st.error("Uploaded dataset structure appears broken or empty.")
     st.stop()
 
 df = clean_raw(raw_data)
-st.success("Data successfully optimized and structural mapping completed!")
+st.success("Data parsing completed and structural field matching verified!")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 EDA", "🧮 ABC–XYZ", "📈 Forecast", 
-    "📦 Inventory", "⏳ Time Series", "📋 Summary Dashboard"
+    "📊 EDA & Data Sample", "🧮 ABC–XYZ Matrix", "📈 Advanced Forecasting", 
+    "💸 Real Cost & Inventory", "⏳ Daily Time Series", "📋 Summary Dashboard"
 ])
 
 with tab1:
     st.header("📊 Exploratory Data Analysis & Structure")
     st.dataframe(df.head(10))
-    st.metric("Total Row Records", f"{len(df):,}")
+    st.metric("Total Records Ingested", f"{len(df):,}")
 
 monthly = get_monthly(df)
 if not monthly:
-    st.warning("Insufficient data available to classify historical steps or draw time steps.")
+    st.warning("Insufficient data frequency to populate matrix operations.")
     st.stop()
 
 items_list = [f"{c} - {d}" for (c, d) in monthly.keys()]
@@ -327,6 +365,7 @@ selected_product = st.sidebar.selectbox("🎯 Target Product Selection", items_l
 selected_key = list(monthly.keys())[items_list.index(selected_product)]
 p_code, p_desc = selected_key
 
+# Filter active row scope
 product_df = df[(df["Material"] == p_code) & (df["Description"] == p_desc)].copy()
 if product_df.empty:
     product_df = df.copy()
@@ -335,9 +374,10 @@ product_df = product_df.set_index("Date")
 full_daily_range = pd.date_range(start=product_df.index.min(), end=product_df.index.max(), freq='D')
 product_df = product_df.reindex(full_daily_range).fillna({"Quantity": 0.0, "Inflow": 0.0, "Material": p_code, "Description": p_desc})
 product_df = product_df.reset_index().rename(columns={"index": "Date"})
+product_df["t"] = np.arange(1, len(product_df) + 1)
 
 # =============================================================================
-# TAB 2 — ABC–XYZ ANALYSIS
+# TAB 2 — ABC–XYZ CLASSIFICATIONS
 # =============================================================================
 with tab2:
     st.header("🧮 ABC–XYZ Matrix Analytics")
@@ -346,10 +386,10 @@ with tab2:
     
     col_a, col_b = st.columns(2)
     with col_a:
-        st.subheader("ABC Cumulative Shares")
+        st.subheader("ABC Volume Stratification")
         st.dataframe(df_abc)
     with col_b:
-        st.subheader("XYZ Coefficients of Variation")
+        st.subheader("XYZ Dispersion Index")
         st.dataframe(df_xyz)
         
     st.subheader("Combined ABC-XYZ Color Mapping Grid")
@@ -363,102 +403,101 @@ with tab2:
     st.markdown(styled.to_html(), unsafe_allow_html=True)
 
 # =============================================================================
-# TAB 3 — ADVANCED FORECASTING
+# TAB 3 — ADVANCED FORECASTING (INTEGRATED NEW ROLLING ONE-STEP ENGINE)
 # =============================================================================
 with tab3:
-    st.header("📈 Forecast Models")
+    st.header("📈 High-Fidelity Rolling 1-Step Forecast Engine (Daily)")
     
-    daily_series = product_df.set_index("Date")["Quantity"]
-    n_days = len(daily_series)
+    cutoff_dt = pd.Timestamp(TEST_START)
+    train_frame = product_df[product_df["Date"] < cutoff_dt].reset_index(drop=True)
+    test_frame = product_df[product_df["Date"] >= cutoff_dt].reset_index(drop=True)
     
-    if n_days < 15:
-        st.warning("Not enough data points found to evaluate multi-model recursive paths safely.")
+    if len(train_frame) < N_LAGS or len(test_frame) == 0:
+        st.warning(f"Data configuration criteria not met. Confirm training series spans prior to cutoff: {TEST_START}")
     else:
-        split_idx = int(n_days * 0.8)
-        train_seq = daily_series.iloc[:split_idx]
-        test_seq = daily_series.iloc[split_idx:]
+        st.write(f"**Execution Profile:** Training Days: `{len(train_frame)}` | Testing Days Evaluation Window: `{len(test_frame)}`")
         
-        st.write(f"**Data Span:** {train_seq.index.min().date()} to {test_seq.index.max().date()} | **Train/Test:** {len(train_seq)}g / {len(test_seq)}g")
+        y_train_series = pd.Series(train_frame[VALUE_COL].values, index=pd.RangeIndex(1, len(train_frame) + 1))
         
-        with st.spinner("Executing Automated SARIMA Grid Search and ML Pipelines..."):
-            fc_sarima, sarima_name = run_sarima_grid(train_seq, test_seq, m=7)
-            fc_xgb = run_ml_forecast(train_seq, test_seq, "xgboost")
-            fc_cat = run_ml_forecast(train_seq, test_seq, "catboost")
+        with st.spinner("Orchestrating SARIMA Append Iterations & Supervised ML Matrices..."):
+            if AUTO_SELECT:
+                order, sorder = select_order_aicc(y_train_series)
+            else:
+                order, sorder = DEFAULT_ORDER, DEFAULT_SORDER
+                
+            # Run updated walk-forward forecasting loops
+            sarima_pred, lo_conf, hi_conf = rolling_one_step_sarima(
+                y_train_series, test_frame[VALUE_COL].values.astype(float), order, sorder
+            )
             
-        m_sarima = calculate_metrics(test_seq, fc_sarima)
-        m_xgb = calculate_metrics(test_seq, fc_xgb)
-        m_cat = calculate_metrics(test_seq, fc_cat)
+            X_tr, y_tr, feature_cols = build_training_matrix(train_frame)
+            xgb_model = fit_xgboost(X_tr, y_tr)
+            cat_model = fit_catboost(X_tr, y_tr)
+            
+            xgb_pred = rolling_one_step_ml(xgb_model, train_frame, test_frame, feature_cols)
+            cat_pred = rolling_one_step_ml(cat_model, train_frame, test_frame, feature_cols)
+            
+        comp_df = build_comparison(test_frame, sarima_pred, lo_conf, hi_conf, xgb_pred, cat_pred)
         
-        metrics_df = pd.DataFrame({
-            "Model Pipeline": [sarima_name, "XGBoost Regressor", "CatBoost Regressor"],
-            "MAE": [m_sarima[0], m_xgb[0], m_cat[0]],
-            "RMSE": [m_sarima[1], m_xgb[1], m_cat[1]],
-            "MAPE (%)": [m_sarima[2], m_xgb[2], m_cat[2]]
+        stats_dict = {
+            "SARIMA":   error_stats(comp_df["Actual"], comp_df["SARIMA"]),
+            "XGBoost":  error_stats(comp_df["Actual"], comp_df["XGBoost"]),
+            "CatBoost": error_stats(comp_df["Actual"], comp_df["CatBoost"]),
+        }
+        
+        # Display Accuracy Table
+        accuracy_df = pd.DataFrame({
+            "Model Specification": [f"SARIMA{order}{sorder[:3]} s={sorder[3]}", "XGBoost Regressor", "CatBoost Regressor"],
+            "MAE": [stats_dict["SARIMA"][0], stats_dict["XGBoost"][0], stats_dict["CatBoost"][0]],
+            "RMSE": [stats_dict["SARIMA"][1], stats_dict["XGBoost"][1], stats_dict["CatBoost"][1]],
+            "MAPE (%)": [stats_dict["SARIMA"][2], stats_dict["XGBoost"][2], stats_dict["CatBoost"][2]]
         })
-        st.table(metrics_df)
+        st.subheader("Model Accuracy Comparisons (Test Window Evaluation)")
+        st.table(accuracy_df)
         
-        fig, ax = plt.subplots(figsize=(14, 5.5))
-        ax.plot(daily_series.index, daily_series.values, color='#1a6faf', alpha=0.6, label='Actual Historical Demand')
+        # Matplotlib Output Generating
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9))
+        boundary_date = train_frame["Date"].iloc[-1]
+
+        # Top Chart
+        ax1.plot(product_df["Date"], product_df[VALUE_COL], color="#1f77b4", linewidth=0.8, alpha=0.6, label="Actual Series Logs")
+        ax1.plot(comp_df["date"], comp_df["SARIMA"], color="#2ca02c", linewidth=1.4, label="SARIMA Path")
+        ax1.plot(comp_df["date"], comp_df["XGBoost"], color="#d62728", linewidth=1.4, linestyle="--", label="XGBoost Path")
+        ax1.plot(comp_df["date"], comp_df["CatBoost"], color="#9467bd", linewidth=1.4, linestyle="-.", label="CatBoost Path")
+        ax1.axvline(boundary_date, color="grey", linestyle=":", linewidth=1.3)
+        ax1.set_title("Full Chronological Validation Series Trends")
+        ax1.legend(loc="upper left")
+        ax1.grid(True, alpha=0.25)
+
+        # Bottom Zoom Window
+        ax2.fill_between(comp_df["date"], comp_df["SARIMA_Lo95"], comp_df["SARIMA_Hi95"], color="#2ca02c", alpha=0.10, label="SARIMA 95% Interval Bound")
+        ax2.plot(comp_df["date"], comp_df["Actual"], color="#1f77b4", linewidth=1.2, marker="o", markersize=3, label="Actual Evaluation Steps")
+        ax2.plot(comp_df["date"], comp_df["SARIMA"], color="#2ca02c", linewidth=1.8, label="SARIMA Out-of-Sample")
+        ax2.plot(comp_df["date"], comp_df["XGBoost"], color="#d62728", linewidth=1.8, linestyle="--", label="XGBoost Out-of-Sample")
+        ax2.plot(comp_df["date"], comp_df["CatBoost"], color="#9467bd", linewidth=1.8, linestyle="-.", label="CatBoost Out-of-Sample")
+        ax2.set_title("Rolling Active Prediction Window Comparisons")
+        ax2.set_xlabel("Time Horizon Axis")
+        ax2.legend(loc="upper left")
+        ax2.grid(True, alpha=0.25)
         
-        last_step = train_seq.iloc[[-1]]
-        ax.plot(pd.concat([last_step, fc_sarima]).index, pd.concat([last_step, fc_sarima]).values, color='#e53935', linestyle='--', label='SARIMA Predict')
-        ax.plot(pd.concat([last_step, fc_xgb]).index, pd.concat([last_step, fc_xgb]).values, color='#43a047', linestyle='-.', label='XGBoost Predict')
-        ax.plot(pd.concat([last_step, fc_cat]).index, pd.concat([last_step, fc_cat]).values, color='#8e24aa', linestyle=':', label='CatBoost Predict')
-        
-        ax.axvspan(test_seq.index[0], test_seq.index[-1], alpha=0.08, color='gray', label='Test Horizon Evaluation Area (%20)')
-        ax.set_title(f"Multi-Model Comparison Chart for Product: {p_code}")
-        ax.set_xlabel("Timeline")
-        ax.set_ylabel("Demand Units")
-        ax.legend(loc="upper left")
-        ax.grid(True, alpha=0.3)
         st.pyplot(fig)
         plt.close()
 
 # =============================================================================
-# TAB 4 — REAL COSTS & INVENTORY OPTIMIZATION (HATA DÜZELTİLMİŞ KESİN TIP ATAMALARI)
+# TAB 4 — REAL COSTS & INVENTORY BALANCE TRACKING
 # =============================================================================
 with tab4:
-    st.header("💸 Material Flows, Costs & Stockout Matrix")
+    st.header("💸 Real Material Flows, Costs & Stockout Matrix")
     
     col_p1, col_p2 = st.columns(2)
     with col_p1:
-        ui_unit_price = st.number_input(
-            "Unit Price (Material Base Cost)", 
-            min_value=0.1, 
-            max_value=50000.0, 
-            value=10.0, 
-            step=1.0
-        )
-        ui_order_cost = st.number_input(
-            "Ordering Setup Cost (Fixed)", 
-            min_value=1.0, 
-            max_value=100000.0, 
-            value=float(ORDERING_COST), 
-            step=10.0
-        )
+        ui_unit_price = st.number_input("Unit Price (Material Base Cost)", min_value=0.1, max_value=50000.0, value=10.0, step=1.0)
+        ui_order_cost = st.number_input("Ordering Setup Cost (Fixed)", min_value=1.0, max_value=100000.0, value=float(ORDERING_COST), step=10.0)
     with col_p2:
-        ui_hold_pct = st.slider(
-            "Holding Cost Rate (Annualized %)", 
-            min_value=0.01, 
-            max_value=1.0, 
-            value=float(HOLDING_COST_PCT), 
-            step=0.01
-        )
-        ui_stockout_cost = st.number_input(
-            "Penalty/Stockout Cost Per Unit Shortage", 
-            min_value=0.0, 
-            max_value=5000.0, 
-            value=float(STOCKOUT_COST_PER_UNIT),
-            step=1.0
-        )
+        ui_hold_pct = st.slider("Holding Cost Rate (Annualized %)", 0.01, 1.0, float(HOLDING_COST_PCT), step=0.01)
+        ui_stockout_cost = st.number_input("Penalty/Stockout Cost Per Unit Shortage", min_value=0.0, max_value=5000.0, value=float(STOCKOUT_COST_PER_UNIT), step=1.0)
         
-    ui_lead_time = st.number_input(
-        "Lead Time Duration (Days)", 
-        min_value=1, 
-        max_value=90, 
-        value=int(7),
-        step=1
-    )
+    ui_lead_time = st.number_input("Lead Time Duration (Days)", min_value=1, max_value=90, value=int(7), step=1)
     
     calculated_df = calculate_real_inventory(product_df)
     cost_df = calculate_real_inventory_costs(calculated_df, ui_unit_price, ui_order_cost, ui_hold_pct, ui_stockout_cost)
@@ -516,14 +555,14 @@ with tab4:
     plt.close()
 
 # =============================================================================
-# TAB 5 — DAILY TIME SERIES VISUALIZATION
+# TAB 5 — DAILY TIME SERIES
 # =============================================================================
 with tab5:
     st.header("⏳ Baseline Historical Time Series Data")
     st.line_chart(product_df.set_index("Date")["Quantity"])
 
 # =============================================================================
-# TAB 6 — SUMMARY SYSTEM DASHBOARD
+# TAB 6 — CONTROL SUMMARY DASHBOARD
 # =============================================================================
 with tab6:
     st.header("📋 Executive Summary Control Board")
@@ -541,4 +580,4 @@ with tab6:
         st.success(f"**Recommended Batch Size (Q*):** {inv_stats['eoq']:.0f} Units")
         st.success(f"**Recommended Trigger Threshold (ROP):** {inv_stats['rop']:.0f} Units")
         
-    st.info("System integration parameters running healthy. Export options and reports generated successfully.")
+    st.info("System integration running stable. Interface numeric data typing verified.")
