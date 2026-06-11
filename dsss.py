@@ -376,7 +376,7 @@ if df is None or df.empty:
 df = clean_raw(df)
 st.success("Data successfully loaded!")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     ["📊 EDA", "🧮 ABC–XYZ", "📈 Forecast", "📦 Inventory", "⏳ Time Series", "📋 Dashboard"]
 )
 
