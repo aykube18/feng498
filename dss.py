@@ -219,7 +219,6 @@ def error_stats(actual, pred):
     mape = float(np.mean(np.abs(err[mask] / actual[mask])) * 100.0) if mask.any() else np.nan
     return mae, rmse, mape
 
-# DETECTED FIX: Added missing structural alignment frame function
 def build_comparison(test, sarima_pred, lo, hi, xgb_pred, cat_pred) -> pd.DataFrame:
     out = pd.DataFrame({
         "date": test["Date"].values,
@@ -264,7 +263,7 @@ def xyz_analysis(monthly_dict):
     return pd.DataFrame(records, columns=["Material", "Description", "Mean", "Std", "CV", "XYZ"])
 
 # =============================================================================
-# 5. INVENTORY ENGINE MATRIX LOGIC
+# 5. INVENTORY ENGINE MATRIX LOGIC (ARDIŞIK BESLEME REVIZYONU)
 # =============================================================================
 def calculate_real_inventory(df):
     df = df.copy()
@@ -297,15 +296,14 @@ def calculate_real_inventory_costs(df, unit_price, order_cost, hold_pct, stockou
     df["Total_Cost_Daily"] = df["Holding_Cost_Daily"] + df["Ordering_Cost_Daily"] + df["Stockout_Cost_Daily"]
     return df
 
-def calculate_eoq_rop_stats(df, unit_price, order_cost, hold_pct, service_level, lead_time_days):
-    consumption = df["Quantity"].values
-    days = len(df)
-    total_consumption = consumption.sum()
-    avg_daily_consumption = total_consumption / days if days > 0 else 0
+# REVISED: Envanteri tahmin sonuçlarından (Forecast) besleyecek şekilde değiştirildi.
+def calculate_eoq_rop_stats_from_forecast(forecast_series, unit_price, order_cost, hold_pct, service_level, lead_time_days):
+    forecast_values = forecast_series.values
+    days = len(forecast_values)
+    total_forecast_consumption = forecast_values.sum()
+    avg_daily_consumption = total_forecast_consumption / days if days > 0 else 0
 
-    consumption_nonzero = consumption[consumption > 0]
-    std_consumption = consumption_nonzero.std() if len(consumption_nonzero) > 1 else avg_daily_consumption * 0.3
-    std_daily = std_consumption / np.sqrt(days) if days > 1 else avg_daily_consumption * 0.3
+    std_daily = forecast_values.std() if days > 1 else avg_daily_consumption * 0.3
     cv = (std_daily / avg_daily_consumption * 100) if avg_daily_consumption > 0 else 0
 
     annual_demand = avg_daily_consumption * 365.0
@@ -359,19 +357,12 @@ if raw_data is None or raw_data.empty:
 df = clean_raw(raw_data)
 st.success("Data parsing completed and structural field matching verified!")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 EDA & Data Sample", "🧮 ABC–XYZ Matrix", "📈 Advanced Forecasting", 
-    "💸 Real Cost & Inventory", "⏳ Daily Time Series", "📋 Summary Dashboard"
-])
-
-with tab1:
-    st.header("📊 Exploratory Data Analysis & Structure")
-    st.dataframe(df.head(10))
-    st.metric("Total Records Ingested", f"{len(df):,}")
-
+# PRE-CALCULATE FORECAST PIPELINE BEFORE TABS FOR INTER-TAB DEPENDENCY
+cutoff_dt = pd.Timestamp(TEST_START)
 monthly = get_monthly(df)
+
 if not monthly:
-    st.warning("Insufficient data frequency to populate matrix operations.")
+    st.warning("Insufficient data frequency to populate analytics matrix operations.")
     st.stop()
 
 items_list = [f"{c} - {d}" for (c, d) in monthly.keys()]
@@ -379,7 +370,6 @@ selected_product = st.sidebar.selectbox("🎯 Target Product Selection", items_l
 selected_key = list(monthly.keys())[items_list.index(selected_product)]
 p_code, p_desc = selected_key
 
-# Filter active row scope
 product_df = df[(df["Material"] == p_code) & (df["Description"] == p_desc)].copy()
 if product_df.empty:
     product_df = df.copy()
@@ -390,9 +380,55 @@ product_df = product_df.reindex(full_daily_range).fillna({"Quantity": 0.0, "Infl
 product_df = product_df.reset_index().rename(columns={"index": "Date"})
 product_df["t"] = np.arange(1, len(product_df) + 1)
 
-# =============================================================================
-# TAB 2 — ABC–XYZ CLASSIFICATIONS
-# =============================================================================
+train_frame = product_df[product_df["Date"] < cutoff_dt].reset_index(drop=True)
+test_frame = product_df[product_df["Date"] >= cutoff_dt].reset_index(drop=True)
+
+# CORE REVISION: Calculate forecast models early so metrics can feed the inventory logic dynamically
+has_valid_forecast = False
+if len(train_frame) >= N_LAGS and len(test_frame) > 0:
+    y_train_series = pd.Series(train_frame[VALUE_COL].values, index=pd.RangeIndex(1, len(train_frame) + 1))
+    
+    if AUTO_SELECT:
+        order, sorder = select_order_aicc(y_train_series)
+    else:
+        order, sorder = DEFAULT_ORDER, DEFAULT_SORDER
+        
+    sarima_pred, lo_conf, hi_conf = rolling_one_step_sarima(
+        y_train_series, test_frame[VALUE_COL].values.astype(float), order, sorder
+    )
+    
+    X_tr, y_tr, feature_cols = build_training_matrix(train_frame)
+    xgb_model = fit_xgboost(X_tr, y_tr)
+    cat_model = fit_catboost(X_tr, y_tr)
+    
+    xgb_pred = rolling_one_step_ml(xgb_model, train_frame, test_frame, feature_cols)
+    cat_pred = rolling_one_step_ml(cat_model, train_frame, test_frame, feature_cols)
+    
+    comp_df = build_comparison(test_frame, sarima_pred, lo_conf, hi_conf, xgb_pred, cat_pred)
+    
+    stats_dict = {
+        "SARIMA":   error_stats(comp_df["Actual"], comp_df["SARIMA"]),
+        "XGBoost":  error_stats(comp_df["Actual"], comp_df["XGBoost"]),
+        "CatBoost": error_stats(comp_df["Actual"], comp_df["CatBoost"]),
+    }
+    
+    # CRITICAL DEPENDENCY LINK: Find the model with lowest MAE and select its forecast to feed inventory block [cite: 184, 218]
+    maes = {"SARIMA": stats_dict["SARIMA"][0], "XGBoost": stats_dict["XGBoost"][0], "CatBoost": stats_dict["CatBoost"][0]}
+    best_model_name = min(maes, key=maes.get)
+    comp_df["Best_Forecast"] = comp_df[best_model_name]
+    has_valid_forecast = True
+
+# UI Tabs Mapping
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 EDA ", "🧮 ABC–XYZ", "📈 Forecast", 
+    "📦 Inventory", "⏳ Time Series", "📋 Dashboard"
+])
+
+with tab1:
+    st.header("📊 Exploratory Data Analysis & Structure")
+    st.dataframe(df.head(10))
+    st.metric("Total Records Ingested", f"{len(df):,}")
+
 with tab2:
     st.header("🧮 ABC–XYZ Matrix Analytics")
     df_abc = abc_analysis(monthly)
@@ -421,87 +457,47 @@ with tab2:
 # =============================================================================
 with tab3:
     st.header("📈 High-Fidelity Rolling 1-Step Forecast Engine (Daily)")
-    
-    cutoff_dt = pd.Timestamp(TEST_START)
-    train_frame = product_df[product_df["Date"] < cutoff_dt].reset_index(drop=True)
-    test_frame = product_df[product_df["Date"] >= cutoff_dt].reset_index(drop=True)
-    
-    if len(train_frame) < N_LAGS or len(test_frame) == 0:
-        st.warning(f"Data configuration criteria not met. Confirm training series spans prior to cutoff: {TEST_START}")
+    if not has_valid_forecast:
+        st.warning(f"Data configuration criteria not met for forecast loops.")
     else:
         st.write(f"**Execution Profile:** Training Days: `{len(train_frame)}` | Testing Days Evaluation Window: `{len(test_frame)}`")
+        st.info(f"🏆 **Automated Model Selector:** **{best_model_name}** has the lowest MAE error profile. Its parameters are dispatched to feed the Inventory matrix step seamlessly.")
         
-        y_train_series = pd.Series(train_frame[VALUE_COL].values, index=pd.RangeIndex(1, len(train_frame) + 1))
-        
-        with st.spinner("Orchestrating SARIMA Append Iterations & Supervised ML Matrices..."):
-            if AUTO_SELECT:
-                order, sorder = select_order_aicc(y_train_series)
-            else:
-                order, sorder = DEFAULT_ORDER, DEFAULT_SORDER
-                
-            # Run updated walk-forward forecasting loops
-            sarima_pred, lo_conf, hi_conf = rolling_one_step_sarima(
-                y_train_series, test_frame[VALUE_COL].values.astype(float), order, sorder
-            )
-            
-            X_tr, y_tr, feature_cols = build_training_matrix(train_frame)
-            xgb_model = fit_xgboost(X_tr, y_tr)
-            cat_model = fit_catboost(X_tr, y_tr)
-            
-            xgb_pred = rolling_one_step_ml(xgb_model, train_frame, test_frame, feature_cols)
-            cat_pred = rolling_one_step_ml(cat_model, train_frame, test_frame, feature_cols)
-            
-        comp_df = build_comparison(test_frame, sarima_pred, lo_conf, hi_conf, xgb_pred, cat_pred)
-        
-        stats_dict = {
-            "SARIMA":   error_stats(comp_df["Actual"], comp_df["SARIMA"]),
-            "XGBoost":  error_stats(comp_df["Actual"], comp_df["XGBoost"]),
-            "CatBoost": error_stats(comp_df["Actual"], comp_df["CatBoost"]),
-        }
-        
-        # Display Accuracy Table
         accuracy_df = pd.DataFrame({
             "Model Specification": [f"SARIMA{order}{sorder[:3]} s={sorder[3]}", "XGBoost Regressor", "CatBoost Regressor"],
             "MAE": [stats_dict["SARIMA"][0], stats_dict["XGBoost"][0], stats_dict["CatBoost"][0]],
             "RMSE": [stats_dict["SARIMA"][1], stats_dict["XGBoost"][1], stats_dict["CatBoost"][1]],
             "MAPE (%)": [stats_dict["SARIMA"][2], stats_dict["XGBoost"][2], stats_dict["CatBoost"][2]]
         })
-        st.subheader("Model Accuracy Comparisons (Test Window Evaluation)")
         st.table(accuracy_df)
         
-        # Matplotlib Output Generating
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9))
         boundary_date = train_frame["Date"].iloc[-1]
 
-        # Top Chart
         ax1.plot(product_df["Date"], product_df[VALUE_COL], color="#1f77b4", linewidth=0.8, alpha=0.6, label="Actual Series Logs")
         ax1.plot(comp_df["date"], comp_df["SARIMA"], color="#2ca02c", linewidth=1.4, label="SARIMA Path")
         ax1.plot(comp_df["date"], comp_df["XGBoost"], color="#d62728", linewidth=1.4, linestyle="--", label="XGBoost Path")
         ax1.plot(comp_df["date"], comp_df["CatBoost"], color="#9467bd", linewidth=1.4, linestyle="-.", label="CatBoost Path")
         ax1.axvline(boundary_date, color="grey", linestyle=":", linewidth=1.3)
-        ax1.set_title("Full Chronological Validation Series Trends")
         ax1.legend(loc="upper left")
         ax1.grid(True, alpha=0.25)
 
-        # Bottom Zoom Window
         ax2.fill_between(comp_df["date"], comp_df["SARIMA_Lo95"], comp_df["SARIMA_Hi95"], color="#2ca02c", alpha=0.10, label="SARIMA 95% Interval Bound")
         ax2.plot(comp_df["date"], comp_df["Actual"], color="#1f77b4", linewidth=1.2, marker="o", markersize=3, label="Actual Evaluation Steps")
         ax2.plot(comp_df["date"], comp_df["SARIMA"], color="#2ca02c", linewidth=1.8, label="SARIMA Out-of-Sample")
         ax2.plot(comp_df["date"], comp_df["XGBoost"], color="#d62728", linewidth=1.8, linestyle="--", label="XGBoost Out-of-Sample")
         ax2.plot(comp_df["date"], comp_df["CatBoost"], color="#9467bd", linewidth=1.8, linestyle="-.", label="CatBoost Out-of-Sample")
-        ax2.set_title("Rolling Active Prediction Window Comparisons")
         ax2.set_xlabel("Time Horizon Axis")
         ax2.legend(loc="upper left")
         ax2.grid(True, alpha=0.25)
-        
         st.pyplot(fig)
         plt.close()
 
 # =============================================================================
-# TAB 4 — REAL COSTS & INVENTORY BALANCE TRACKING
+# TAB 4 — REAL COSTS & INVENTORY BALANCE TRACKING (DEPENDENCY SOLVED)
 # =============================================================================
 with tab4:
-    st.header("💸 Real Material Flows, Costs & Stockout Matrix")
+    st.header("📦 Inventory")
     
     col_p1, col_p2 = st.columns(2)
     with col_p1:
@@ -515,8 +511,15 @@ with tab4:
     
     calculated_df = calculate_real_inventory(product_df)
     cost_df = calculate_real_inventory_costs(calculated_df, ui_unit_price, ui_order_cost, ui_hold_pct, ui_stockout_cost)
-    inv_stats = calculate_eoq_rop_stats(cost_df, ui_unit_price, ui_order_cost, ui_hold_pct, SERVICE_LEVEL, ui_lead_time)
     
+    # SYSTEM LINK UP: If forecast is ready, calculate targets using the prediction dataset metrics [cite: 184, 201]
+    if has_valid_forecast:
+        inv_stats = calculate_eoq_rop_stats_from_forecast(comp_df["Best_Forecast"], ui_unit_price, ui_order_cost, ui_hold_pct, SERVICE_LEVEL, ui_lead_time)
+        st.caption(f"💡 **Data-Link Active:** Target optimizations calculated over upcoming demand projections using **{best_model_name}** pipelines.")
+    else:
+        inv_stats = calculate_eoq_rop_stats_from_forecast(product_df["Quantity"], ui_unit_price, ui_order_cost, ui_hold_pct, SERVICE_LEVEL, ui_lead_time)
+        st.caption("⚠️ **Data-Link Fallback:** Optimization using historical mean logs due to insufficient forecast runtime windows.")
+        
     total_h = cost_df["Holding_Cost_Daily"].sum()
     total_o = cost_df["Ordering_Cost_Daily"].sum()
     total_s = cost_df["Stockout_Cost_Daily"].sum()
@@ -539,15 +542,15 @@ with tab4:
         
     with col_m2:
         st.subheader("Operational Trajectory Realizations")
-        st.metric("Average Daily Sales Demand", f"{inv_stats['avg_daily_consumption']:.2f} Units")
+        st.metric("Average Daily Predicted Sales Demand", f"{inv_stats['avg_daily_consumption']:.2f} Units")
         st.metric("Stockout Occurrence Days", f"{(cost_df['Stockout'] > 0).sum()} Days")
         
     st.subheader("Real Inventory Balance & Safety Bands Over Time")
     fig_st, ax_st = plt.subplots(figsize=(14, 4.5))
     days_arr = range(len(cost_df))
     ax_st.plot(days_arr, cost_df["Envanter"], color="#DC2626", linewidth=2, label="Actual On-Hand Balance Level")
-    ax_st.axhline(y=inv_stats["rop"], color="#16A34A", linestyle="--", label=f"Optimal ROP Line ({inv_stats['rop']:.1f})")
-    ax_st.axhline(y=inv_stats["eoq"], color="#D97706", linestyle="-.", label=f"Optimal EOQ Line ({inv_stats['eoq']:.1f})")
+    ax_st.axhline(y=inv_stats["rop"], color="#16A34A", linestyle="--", label=f"Optimal Forecast-Based ROP Line ({inv_stats['rop']:.1f})")
+    ax_st.axhline(y=inv_stats["eoq"], color="#D97706", linestyle="-.", label=f"Optimal Forecast-Based EOQ Line ({inv_stats['eoq']:.1f})")
     ax_st.fill_between(days_arr, 0, inv_stats["rop"], alpha=0.05, color="#16A34A", label="Safety Stock Band")
     ax_st.set_xlabel("Day Progress")
     ax_st.set_ylabel("Quantity Units")
@@ -586,12 +589,12 @@ with tab6:
         st.markdown(f"""
         - **Target Inventory Code:** `{p_code}`
         - **Description Tag:** `{p_desc}`
-        - **Calculated Theoretical Annual Demand:** `{inv_stats['annual_demand']:,.0f} Units`
+        - **Calculated Prediction-Based Annual Demand:** `{inv_stats['annual_demand']:,.0f} Units`
         - **Assigned Procurement Lead Time:** `{ui_lead_time} Days`
         """)
     with db_col2:
         st.subheader("Target Recommendation Engine")
         st.success(f"**Recommended Batch Size (Q*):** {inv_stats['eoq']:.0f} Units")
         st.success(f"**Recommended Trigger Threshold (ROP):** {inv_stats['rop']:.0f} Units")
-        
-    st.info("System integration running stable. Interface numeric data typing verified.")
+        if has_valid_forecast:
+            st.caption(f"🎯 *Note:* These metrics are dynamically powered by your most accurate machine learning projection path (**{best_model_name}**)[cite: 184, 218].")
