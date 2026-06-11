@@ -601,7 +601,7 @@ with tab5:
 # TAB 6 — DASHBOARD
 # -------------------------
 with tab6:
-    st.header("📋 Dashboard — Summary")
+    st.header("📋 Summary Dashboard")
 
     if series_m is None:
         st.info("Dashboard is not available because no product could be selected.")
@@ -636,18 +636,4 @@ with tab6:
         st.metric("Daily Std Dev", f"{std_daily:.2f}")
         st.metric("Default Service Level", f"{SERVICE_LEVEL*100:.0f}%")
 
-# -------------------------
-# TAB 7 — INFO
-# -------------------------
-with tab7:
-    st.header("ℹ Info")
-    st.markdown("""
-This integrated DSS includes:
-- EDA
-- ABC-XYZ classification (with color-coded matrix)
-- Forecasting (ARIMA, XGBoost, CatBoost)
-- Simulation-based inventory optimization (ROP, EOQ, stockouts, fill rate)
-- Time series visualization
-- Summary dashboard
-""")
 
