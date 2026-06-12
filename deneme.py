@@ -1,3 +1,12 @@
+# ENTEGRASYON NOTU
+# Eski UI korunmuştur.
+# Yeni envanter modeli dosyası ayrıca eklenmiştir.
+# Bu çıktı manuel entegrasyon incelemesi için oluşturulmuştur.
+
+########################
+# ESKI UI KODU
+########################
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -186,6 +195,160 @@ def xyz_analysis(monthly_dict):
 
     df = pd.DataFrame(records, columns=["Material", "Description", "Mean", "Std", "CV", "XYZ"])
     return df
+
+# =============================================================================
+# 5. INVENTORY LOGIC (SIMULATION-BASED)
+# =============================================================================
+
+SERVICE_LEVEL = 0.95
+ORDERING_COST = 2000.0
+HOLDING_COST_PCT = 0.25
+UNIT_COST = 1.0
+SIMULATION_DAYS = 365
+DEFAULT_LEAD_TIME_DAYS = 7
+
+@dataclass
+class MaterialItem:
+    code: str
+    name: str
+    mean_daily: float
+    std_daily: float
+    distribution: str = "gamma"
+    lead_time_days: int = DEFAULT_LEAD_TIME_DAYS
+
+def calculate_reorder_point(mean_daily: float, std_daily: float,
+                            lead_time_days: int,
+                            service_level: float,
+                            distribution: str = "normal") -> float:
+    if mean_daily <= 0:
+        return 0.0
+    lt_mean = mean_daily * lead_time_days
+    lt_std = std_daily * math.sqrt(lead_time_days)
+    try:
+        z = norm.ppf(service_level)
+        return max(0.0, lt_mean + z * lt_std)
+    except Exception:
+        return max(0.0, lt_mean)
+
+def calculate_eoq(mean_daily: float,
+                  ordering_cost: float = ORDERING_COST,
+                  holding_cost_pct: float = HOLDING_COST_PCT,
+                  unit_cost: float = UNIT_COST) -> float:
+    if mean_daily <= 0:
+        return 1.0
+    annual_demand = mean_daily * 365
+    holding_cost = holding_cost_pct * unit_cost
+    if holding_cost <= 0 or annual_demand <= 0:
+        return max(mean_daily * 30, 1)
+    try:
+        eoq = math.sqrt((2 * annual_demand * ordering_cost) / holding_cost)
+        return max(1.0, eoq)
+    except Exception:
+        return max(mean_daily * 30, 1)
+
+def _generate_daily_demand(mean_daily: float, std_daily: float,
+                           distribution: str, day: int) -> float:
+    day_factor = 0.8 if day % 7 in [5, 6] else 1.0
+    spike = np.random.gamma(2, 10) if np.random.random() < 0.05 else 0.0
+
+    if distribution == "normal":
+        base = max(0.0, np.random.normal(mean_daily, std_daily))
+    elif distribution == "gamma":
+        if std_daily <= 0 or mean_daily <= 0:
+            base = mean_daily
+        else:
+            shape = (mean_daily ** 2) / (std_daily ** 2)
+            scale = (std_daily ** 2) / mean_daily
+            base = np.random.gamma(shape=shape, scale=scale)
+    elif distribution == "lognormal":
+        if std_daily <= 0 or mean_daily <= 0:
+            base = mean_daily
+        else:
+            sigma = np.sqrt(np.log((std_daily ** 2 / mean_daily ** 2) + 1))
+            mu = np.log(mean_daily) - (sigma ** 2) / 2
+            base = np.random.lognormal(mean=mu, sigma=sigma)
+    else:
+        base = mean_daily
+
+    return max(0.0, base * day_factor + spike)
+
+def simulate_inventory_with_real_data(item: MaterialItem,
+                                      reorder_point: float,
+                                      order_qty: float,
+                                      simulation_days: int = SIMULATION_DAYS):
+    daily_demands = [
+        _generate_daily_demand(item.mean_daily, item.std_daily, item.distribution, day)
+        for day in range(simulation_days)
+    ]
+
+    inventory_history = []
+    demand_history = []
+    order_history = []
+    pending_orders = []
+
+    current_inventory = order_qty
+    total_demand = 0.0
+    total_shortage = 0.0
+    total_fulfilled = 0.0
+    stockout_days = 0
+
+    for day in range(simulation_days):
+        received = 0
+        still_pending = []
+        for arrival_day, qty in pending_orders:
+            if day >= arrival_day:
+                received += qty
+            else:
+                still_pending.append((arrival_day, qty))
+        pending_orders = still_pending
+        current_inventory += received
+
+        demand = daily_demands[day]
+        total_demand += demand
+        demand_history.append(demand)
+
+        if current_inventory >= demand:
+            fulfilled = demand
+            current_inventory -= fulfilled
+            total_fulfilled += fulfilled
+        else:
+            fulfilled = current_inventory
+            shortage = demand - fulfilled
+            current_inventory = -shortage
+            total_shortage += shortage
+            stockout_days += 1
+            total_fulfilled += fulfilled
+
+        if current_inventory <= reorder_point and len(pending_orders) == 0:
+            arrival_day = day + item.lead_time_days
+            pending_orders.append((arrival_day, order_qty))
+            order_history.append((day, order_qty))
+
+        inventory_history.append(current_inventory)
+
+    inv_arr = np.array(inventory_history, dtype=float)
+    fill_rate = (total_fulfilled / total_demand * 100) if total_demand > 0 else 0.0
+
+    result = {
+        "avg_inventory": float(inv_arr[inv_arr >= 0].mean()) if np.any(inv_arr >= 0) else 0.0,
+        "min_inventory": float(inv_arr.min()) if len(inv_arr) > 0 else 0.0,
+        "max_inventory": float(inv_arr.max()) if len(inv_arr) > 0 else 0.0,
+        "total_demand": total_demand,
+        "total_shortage": total_shortage,
+        "stockout_days": stockout_days,
+        "fill_rate": fill_rate,
+        "reorder_point": reorder_point,
+        "order_quantity": order_qty,
+    }
+
+    history = {
+        "days": list(range(simulation_days)),
+        "inventory": inventory_history,
+        "demand": demand_history,
+        "orders": order_history,
+    }
+
+    return result, history
 
 # =============================================================================
 # 6. COLOR FUNCTION FOR ABC–XYZ MATRIX
@@ -481,3 +644,666 @@ with tab6:
         st.metric("Daily Mean Demand", f"{mean_daily:.2f}")
         st.metric("Daily Std Dev", f"{std_daily:.2f}")
         st.metric("Default Service Level", f"{SERVICE_LEVEL*100:.0f}%")
+
+########################
+# YENI ENVANTER MODELI
+########################
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from scipy import stats
+from typing import Dict, List, Tuple
+import math
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION FOR ForecastEOQ.xlsx
+# ══════════════════════════════════════════════════════════════════════════════
+
+EXCEL_FILE = "/content/ForecastEOQ.xlsx"
+OUTPUT_DIR = "/content/"
+MATERIAL_CODES = [600080, 600096, 600102, 600112, 603789, 603812, 607290, 626100, 627518, 627519]
+
+SHORT_NAMES: Dict[int, str] = {
+    600080: "MOTORIN",
+    600096: "TOKA 32",
+    600102: "ÇEMBER TOKA",
+    600112: "SIYAH ÇEMBER",
+    603789: "ELDİVEN",
+    603812: "KULAK TIKACI",
+    607290: "Ç.4140",
+    626100: "SAPAN",
+    627518: "BRK 77x60",
+    627519: "BRK 80x122",
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORDERING COST PARAMETERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+ORDERING_COST = 2792  # TRY - Fixed ordering cost per order
+HOLDING_COST_PCT = 0.25  # 25% - Annual holding cost percentage
+SERVICE_LEVEL = 0.95  # 95% service level
+STOCKOUT_COST_PER_UNIT = 500  # TRY - Cost per unit of stockout (lost sales + penalty)
+
+COLORS = [
+    "#2563EB", "#DC2626", "#16A34A", "#D97706", "#7C3AED",
+    "#0891B2", "#DB2777", "#65A30D", "#EA580C", "#6366F1",
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOAD DATA FROM EXCEL - ForecastEOQ.xlsx (REAL DATA)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_material_data(filepath: str, material_code: int) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Load real data for a material from ForecastEOQ.xlsx.
+
+    Columns: Tarih, Mal Giriş, Tüketim Miktarı, Unit Price, Para Birimi, Lead time
+    """
+    try:
+        df = pd.read_excel(filepath, sheet_name=str(material_code))
+
+        # Clean column names
+        df.columns = df.columns.str.strip()
+
+        # Convert date column to datetime
+        df["Tarih"] = pd.to_datetime(df["Tarih"])
+        df = df.sort_values("Tarih").reset_index(drop=True)
+
+        # Fill NaN values with 0
+        df["Mal Giriş"] = df["Mal Giriş"].fillna(0)
+        df["Tüketim Miktarı"] = df["Tüketim Miktarı"].fillna(0)
+
+        # Extract metadata (from first row)
+        unit_price = float(df["Unit Price"].iloc[0]) if "Unit Price" in df.columns else 1.0
+        currency = str(df["Para Birimi"].iloc[0]) if "Para Birimi" in df.columns else "TRY"
+        lead_time = int(df["Lead time"].iloc[0]) if "Lead time" in df.columns else 2
+
+        metadata = {
+            "unit_price": unit_price,
+            "currency": currency,
+            "lead_time": lead_time,
+            "material_code": material_code,
+            "material_name": SHORT_NAMES.get(material_code, str(material_code)),
+        }
+
+        return df, metadata
+
+    except Exception as e:
+        print(f"❌ Error reading material code {material_code} → {str(e)}")
+        return None, None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CALCULATE REAL INVENTORY (Allow negative for stockout visibility)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calculate_real_inventory(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Real Inventory = Previous Inventory + Inflow - Consumption
+    
+    Allows negative inventory (stockout) to show below zero line.
+    """
+    df = df.copy()
+    df["Envanter"] = 0.0
+    df["Stockout"] = 0.0
+
+    current_inv = 0.0
+    inventory_list = []
+    stockout_list = []
+
+    for idx, row in df.iterrows():
+        current_inv = current_inv + row["Mal Giriş"] - row["Tüketim Miktarı"]
+        
+        if current_inv < 0:
+            stockout_list.append(-current_inv)  # Record shortage
+            # Keep negative value for visualization
+        else:
+            stockout_list.append(0)
+        
+        inventory_list.append(current_inv)
+
+    df["Envanter"] = inventory_list
+    df["Stockout"] = stockout_list
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CALCULATE REAL INVENTORY COSTS (including stockout costs)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calculate_real_inventory_costs(df: pd.DataFrame, metadata: Dict) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Calculate real inventory costs based on actual inflow and consumption data:
+    - Holding Cost = Daily Inventory × Daily Holding Cost Rate
+    - Ordering Cost = Number of Orders × Ordering Cost per Order
+    - Stockout Cost = Shortage Quantity × Stockout Cost per Unit
+    """
+    
+    df = df.copy()
+    unit_price = metadata["unit_price"]
+    
+    # Daily holding cost rate (annual rate / 365)
+    daily_holding_cost_rate = HOLDING_COST_PCT / 365
+    
+    # Daily holding cost = Inventory × Daily Rate × Unit Price (only for positive inventory)
+    df["Holding_Cost_Daily"] = df["Envanter"].clip(lower=0) * daily_holding_cost_rate * unit_price
+    
+    # Detect orders (when inflow > 0)
+    df["Is_Order"] = df["Mal Giriş"] > 0
+    df["Ordering_Cost_Daily"] = df["Is_Order"] * ORDERING_COST
+    
+    # Stockout cost = Shortage Quantity × Cost per Unit
+    df["Stockout_Cost_Daily"] = df["Stockout"] * STOCKOUT_COST_PER_UNIT
+    
+    # Total daily cost
+    df["Total_Cost_Daily"] = df["Holding_Cost_Daily"] + df["Ordering_Cost_Daily"] + df["Stockout_Cost_Daily"]
+    
+    # Calculate summary statistics
+    total_holding_cost = df["Holding_Cost_Daily"].sum()
+    total_ordering_cost = df["Ordering_Cost_Daily"].sum()
+    total_stockout_cost = df["Stockout_Cost_Daily"].sum()
+    total_cost = total_holding_cost + total_ordering_cost + total_stockout_cost
+    
+    days = len(df)
+    avg_daily_cost = total_cost / days if days > 0 else 0
+    annual_cost = avg_daily_cost * 365
+    
+    total_orders = df["Is_Order"].sum()
+    total_stockout_units = df["Stockout"].sum()
+    stockout_days = (df["Stockout"] > 0).sum()
+    
+    cost_summary = {
+        "material_code": metadata["material_code"],
+        "material_name": metadata["material_name"],
+        "days_analyzed": days,
+        "total_holding_cost": round(total_holding_cost, 2),
+        "total_ordering_cost": round(total_ordering_cost, 2),
+        "total_stockout_cost": round(total_stockout_cost, 2),
+        "total_cost": round(total_cost, 2),
+        "avg_daily_cost": round(avg_daily_cost, 2),
+        "annual_cost": round(annual_cost, 2),
+        "total_orders": int(total_orders),
+        "avg_order_qty": round(df[df["Mal Giriş"] > 0]["Mal Giriş"].mean(), 2) if total_orders > 0 else 0,
+        "total_stockout_units": round(total_stockout_units, 2),
+        "stockout_days": int(stockout_days),
+        "unit_price": metadata["unit_price"],
+        "currency": metadata["currency"],
+    }
+    
+    return df, cost_summary
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CALCULATE STATISTICS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calculate_statistics(df: pd.DataFrame, metadata: Dict) -> Dict:
+    """
+    Calculate EOQ and ROP based on real data.
+    """
+    consumption = df["Tüketim Miktarı"].values
+    inflow = df["Mal Giriş"].values
+    inventory = df["Envanter"].values
+
+    # Daily averages
+    days = len(df)
+    total_consumption = consumption.sum()
+    total_inflow = inflow.sum()
+    avg_daily_consumption = total_consumption / days if days > 0 else 0
+
+    # Standard deviation (from Consumption)
+    consumption_nonzero = consumption[consumption > 0]
+    std_consumption = consumption_nonzero.std() if len(consumption_nonzero) > 1 else avg_daily_consumption * 0.3
+
+    # Daily standard deviation
+    std_daily = std_consumption / np.sqrt(len(df)) if len(df) > 1 else avg_daily_consumption * 0.3
+
+    # Coefficient of Variation
+    cv = (std_daily / avg_daily_consumption * 100) if avg_daily_consumption > 0 else 0
+
+    # EOQ Calculation
+    annual_demand = avg_daily_consumption * 365
+    holding_cost = HOLDING_COST_PCT * metadata["unit_price"]
+
+    if annual_demand > 0 and holding_cost > 0:
+        eoq = math.sqrt((2 * annual_demand * ORDERING_COST) / holding_cost)
+    else:
+        eoq = avg_daily_consumption * 30
+
+    eoq = max(1.0, eoq)
+
+    # ROP Calculation (stock required during Lead Time)
+    lead_time = metadata["lead_time"]
+    lt_mean = avg_daily_consumption * lead_time
+    lt_std = std_daily * math.sqrt(lead_time)
+
+    # Z-score (for 95% service level)
+    z = stats.norm.ppf(SERVICE_LEVEL)
+    rop = max(0.0, lt_mean + z * lt_std)
+
+    return {
+        "material_code": metadata["material_code"],
+        "material_name": metadata["material_name"],
+        "total_days": days,
+        "total_consumption": total_consumption,
+        "total_inflow": total_inflow,
+        "avg_daily_consumption": round(avg_daily_consumption, 2),
+        "std_daily": round(std_daily, 2),
+        "cv_percent": round(cv, 1),
+        "max_inventory": float(inventory.max()),
+        "min_inventory": float(inventory.min()),
+        "avg_inventory": float(inventory.mean()),
+        "eoq": round(eoq, 2),
+        "rop": round(rop, 2),
+        "unit_price": metadata["unit_price"],
+        "currency": metadata["currency"],
+        "lead_time": lead_time,
+        "annual_demand": round(annual_demand, 0),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPORT INVENTORY COST DATA TO EXCEL/CSV
+# ══════════════════════════════════════════════════════════════════════════════
+
+def export_inventory_cost_data(df: pd.DataFrame, cost_summary: Dict, output_dir: str) -> None:
+    """
+    Export detailed inventory cost data to Excel & CSV (including stockout)
+    """
+    
+    export_df = pd.DataFrame({
+        "Tarih (Date)": df["Tarih"],
+        "Mal Giriş (Inflow)": df["Mal Giriş"],
+        "Tüketim Miktarı (Consumption)": df["Tüketim Miktarı"],
+        "Envanter (Inventory)": df["Envanter"],
+        "Stockout (Units)": df["Stockout"],
+        "Holding_Cost_Daily (TRY)": df["Holding_Cost_Daily"].round(2),
+        "Ordering_Cost_Daily (TRY)": df["Ordering_Cost_Daily"].round(2),
+        "Stockout_Cost_Daily (TRY)": df["Stockout_Cost_Daily"].round(2),
+        "Total_Cost_Daily (TRY)": df["Total_Cost_Daily"].round(2),
+    })
+    
+    material_name = cost_summary["material_name"].replace(" ", "_")
+    material_code = cost_summary["material_code"]
+    
+    # Save to CSV
+    csv_path = f"{output_dir}03_forecast_inventory_costs_{material_code}_{material_name}.csv"
+    export_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print(f"✅ Inventory cost data saved to CSV → {csv_path}")
+    
+    # Save to Excel
+    excel_path = f"{output_dir}03_forecast_inventory_costs_{material_code}_{material_name}.xlsx"
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        export_df.to_excel(writer, sheet_name="Daily_Costs", index=False)
+    
+    print(f"✅ Inventory cost data saved to Excel → {excel_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ✅ EOQ SAW-TOOTH GRAPH (Shows negative inventory for stockout)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_eoq_graph(df: pd.DataFrame, stats: Dict, cost_summary: Dict, output_path: str) -> None:
+    """
+    Clean EOQ saw-tooth graph showing stockout below zero line
+    """
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10))
+    fig.patch.set_facecolor("#F8FAFC")
+
+    # ─────────────────────────────────────────────────────────────────
+    # 1. INVENTORY LEVEL (with negative stockout zone)
+    # ─────────────────────────────────────────────────────────────────
+
+    ax1.set_facecolor("#FFFFFF")
+    days = range(len(df))
+
+    # Safety stock zone (green)
+    ax1.fill_between(days, 0, stats["rop"], alpha=0.08, color="#16A34A",
+                     label="Safety Stock Zone")
+
+    # Stockout zone (red - below 0)
+    ax1.fill_between(days, 0, df["Envanter"], where=(df["Envanter"] < 0), 
+                     alpha=0.15, color="#EF4444", label="Stockout Zone")
+
+    # Plot real inventory (showing negative values)
+    ax1.plot(days, df["Envanter"], color="#DC2626", linewidth=2.5,
+             label="Real Inventory Level", marker="o", markersize=2,
+             alpha=0.85, zorder=3)
+
+    # ROP line
+    ax1.axhline(y=stats["rop"], color="#16A34A", linestyle="--", linewidth=2.5,
+                label=f"Reorder Point (ROP) = {stats['rop']:.0f}", zorder=2, alpha=0.8)
+
+    # EOQ line
+    ax1.axhline(y=stats["eoq"], color="#D97706", linestyle="--", linewidth=2,
+                label=f"Order Quantity (EOQ) = {stats['eoq']:.0f}", zorder=1, alpha=0.6)
+
+    # Average inventory
+    ax1.axhline(y=stats["avg_inventory"], color="#7C3AED", linestyle=":", linewidth=2.5,
+                label=f"Average Inventory = {stats['avg_inventory']:.0f}", zorder=2, alpha=0.8)
+
+    # Zero line
+    ax1.axhline(y=0, color="#000000", linestyle="-", linewidth=1.5, zorder=0, alpha=0.5)
+
+    ax1.set_xlabel("Days", fontsize=12, fontweight="bold", color="#374151")
+    ax1.set_ylabel("Inventory (units)", fontsize=12, fontweight="bold", color="#374151")
+    ax1.set_title(f"📦 EOQ SAW-TOOTH GRAPH: {stats['material_name']}\nReal Inflow & Consumption Data",
+                  fontsize=13, fontweight="bold", color="#111827", pad=15)
+    ax1.legend(fontsize=10, loc="upper right", framealpha=0.95)
+    ax1.grid(True, alpha=0.25, linestyle="--", color="#9CA3AF", zorder=0)
+    ax1.spines[["top", "right"]].set_visible(False)
+
+    info_text = (f"📊 CONFIGURATION\n"
+                f"Code: {stats['material_code']}\n"
+                f"Lead Time: {stats['lead_time']} days\n"
+                f"Unit Price: {stats['currency']}{stats['unit_price']:.2f}\n"
+                f"Avg Daily Consumption: {stats['avg_daily_consumption']:.2f}\n"
+                f"Std Deviation: {stats['std_daily']:.2f}\n"
+                f"CV: {stats['cv_percent']:.1f}%\n"
+                f"Service Level: {SERVICE_LEVEL*100:.0f}%\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"Total Cost: {stats['currency']}{cost_summary['total_cost']:,.2f}\n"
+                f"Stockout Days: {cost_summary['stockout_days']}")
+
+    ax1.text(0.02, 0.98, info_text, transform=ax1.transAxes, fontsize=9,
+             ha="left", va="top", fontweight="bold", color="#111827",
+             bbox=dict(boxstyle="round,pad=0.8", facecolor="#FEF3C7", alpha=0.95,
+                      edgecolor="#D97706", linewidth=2))
+
+    # ─────────────────────────────────────────────────────────────────
+    # 2. INFLOW vs CONSUMPTION
+    # ─────────────────────────────────────────────────────────────────
+
+    ax2.set_facecolor("#FFFFFF")
+
+    x = np.arange(len(df))
+    width = 0.35
+
+    bars1 = ax2.bar(x - width/2, df["Mal Giriş"], width, label="Inflow",
+                    color="#16A34A", alpha=0.8, edgecolor="white")
+    bars2 = ax2.bar(x + width/2, df["Tüketim Miktarı"], width, label="Consumption",
+                    color="#DC2626", alpha=0.8, edgecolor="white")
+
+    ax2.set_xlabel("Days", fontsize=12, fontweight="bold", color="#374151")
+    ax2.set_ylabel("Quantity (units)", fontsize=12, fontweight="bold", color="#374151")
+    ax2.set_title("Daily Inflow vs Consumption", fontsize=12, fontweight="bold",
+                  color="#111827", pad=15)
+    ax2.legend(fontsize=10, loc="upper right")
+    ax2.grid(True, alpha=0.2, linestyle="--", axis="y")
+    ax2.spines[["top", "right"]].set_visible(False)
+
+    # Reduce X-axis display (many days)
+    if len(df) > 50:
+        step = len(df) // 10
+        ax2.set_xticks(range(0, len(df), step))
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight", facecolor="#F8FAFC")
+    print(f"✅ EOQ Graph saved → {output_path}")
+    plt.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ✅ EOQ COST FUNCTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_eoq_cost_graph(stats: Dict, cost_summary: Dict, output_path: str) -> None:
+    """
+    EOQ Cost Function: Ordering + Holding + Total
+    """
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    fig.patch.set_facecolor("#F8FAFC")
+
+    ax1.set_facecolor("#FFFFFF")
+
+    annual_demand = stats["annual_demand"]
+    eoq_value = stats["eoq"]
+    unit_price = stats["unit_price"]
+
+    Q_range = np.linspace(1, eoq_value * 3, 300)
+
+    # Cost functions
+    ordering_cost = (annual_demand / Q_range) * ORDERING_COST
+    holding_cost = (Q_range / 2) * HOLDING_COST_PCT * unit_price
+    total_cost = ordering_cost + holding_cost
+
+    # Plot
+    ax1.plot(Q_range, ordering_cost, linewidth=2.5, color="#DC2626",
+             label="Ordering Cost", linestyle="--", alpha=0.8)
+    ax1.plot(Q_range, holding_cost, linewidth=2.5, color="#16A34A",
+             label="Holding Cost", linestyle="--", alpha=0.8)
+    ax1.plot(Q_range, total_cost, linewidth=3.5, color="#7C3AED",
+             label="Total Cost", zorder=3)
+
+    # EOQ point
+    eoq_cost = (eoq_value / 2) * HOLDING_COST_PCT * unit_price + \
+               (annual_demand / eoq_value) * ORDERING_COST
+
+    ax1.scatter([eoq_value], [eoq_cost], s=300, color="#D97706", marker="*",
+                zorder=4, edgecolor="black", linewidth=2, label=f"EOQ = {eoq_value:.0f}")
+
+    ax1.axvline(x=eoq_value, color="#D97706", linestyle=":", linewidth=2, alpha=0.7)
+
+    ax1.set_xlabel("Order Quantity (Q)", fontsize=11, fontweight="bold", color="#374151")
+    ax1.set_ylabel(f"Annual Cost ({stats['currency']})", fontsize=11, fontweight="bold", color="#374151")
+    ax1.set_title("EOQ Cost Tradeoff Function", fontsize=12, fontweight="bold", color="#111827")
+    ax1.legend(fontsize=10, loc="upper right", framealpha=0.95)
+    ax1.grid(True, alpha=0.2, linestyle="--")
+    ax1.spines[["top", "right"]].set_visible(False)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Cost Details
+    # ─────────────────────────────────────────────────────────────────
+
+    ax2.axis("off")
+
+    annual_ordering = (annual_demand / eoq_value) * ORDERING_COST
+    annual_holding = (eoq_value / 2) * HOLDING_COST_PCT * unit_price
+    total_annual = annual_ordering + annual_holding
+
+    cost_text = f"""
+📊 EOQ COST ANALYSIS: {stats['material_name']}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📈 DEMAND & PARAMETERS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Annual Demand:           {annual_demand:>12,.0f} units
+Avg Daily Consumption:   {stats['avg_daily_consumption']:>12,.2f} units
+Lead Time:               {stats['lead_time']:>12} days
+Unit Price:              {stats['currency']}{unit_price:>12,.2f}
+CV:                      {stats['cv_percent']:>12.1f}%
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💰 EOQ (OPTIMAL ORDER QUANTITY):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Ordering Cost per Order: {stats['currency']}{ORDERING_COST:>12,.2f}
+Holding Cost Rate:       {HOLDING_COST_PCT*100:>12.1f}%
+
+EOQ Formula: Q* = √(2DS/h)
+  D = {annual_demand:,.0f} (annual demand)
+  S = {stats['currency']}{ORDERING_COST:,.2f} (ordering cost)
+  h = {stats['currency']}{HOLDING_COST_PCT * unit_price:,.3f} (holding cost)
+
+Optimal Order Quantity:  {eoq_value:>12,.0f} units
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💵 ANNUAL COST BREAKDOWN (THEORETICAL):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Ordering Cost:           {stats['currency']}{annual_ordering:>12,.2f}
+Holding Cost:            {stats['currency']}{annual_holding:>12,.2f}
+────────────────────────────────────────
+TOTAL ANNUAL COST:       {stats['currency']}{total_annual:>12,.2f}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💵 ANNUAL COST BREAKDOWN (REAL DATA):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Holding Cost:            {stats['currency']}{cost_summary['total_holding_cost'] * (365/cost_summary['days_analyzed']):>12,.2f}
+Ordering Cost:           {stats['currency']}{cost_summary['total_ordering_cost'] * (365/cost_summary['days_analyzed']):>12,.2f}
+Stockout Cost:           {stats['currency']}{cost_summary['total_stockout_cost'] * (365/cost_summary['days_analyzed']):>12,.2f}
+────────────────────────────────────────
+TOTAL ANNUAL COST:       {stats['currency']}{cost_summary['annual_cost']:>12,.2f}
+
+Average Inventory:       {eoq_value/2:>12,.0f} units
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+    ax2.text(0.05, 0.98, cost_text, transform=ax2.transAxes, fontsize=8,
+             ha="left", va="top", family="monospace", color="#111827",
+             fontweight="bold",
+             bbox=dict(boxstyle="round,pad=1", facecolor="#FEF3C7", alpha=0.95,
+                      edgecolor="#D97706", linewidth=2))
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight", facecolor="#F8FAFC")
+    print(f"✅ EOQ Cost Graph saved → {output_path}")
+    plt.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ✅ SUMMARY TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_summary_table(all_stats: List[Dict], all_costs: List[Dict], output_path: str) -> None:
+    """
+    Summary table for all materials with real costs and stockout data
+    """
+
+    df_stats = pd.DataFrame(all_stats)
+    df_costs = pd.DataFrame(all_costs)
+    
+    # Merge stats and costs
+    df_summary = df_stats.merge(df_costs[["material_code", "total_holding_cost", "total_ordering_cost", 
+                                          "total_stockout_cost", "total_cost", "avg_daily_cost", "annual_cost", 
+                                          "total_orders", "total_stockout_units", "stockout_days"]],
+                               on="material_code")
+    df_summary = df_summary.sort_values("annual_demand", ascending=False)
+
+    # Save to CSV
+    csv_path = output_path.replace(".xlsx", ".csv")
+    df_summary.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print(f"✅ Summary table saved to CSV → {csv_path}")
+
+    # Save to Excel
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df_summary.to_excel(writer, sheet_name="Summary", index=False)
+
+    print(f"✅ Summary table saved to Excel → {output_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSOLE REPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def print_console_report(all_stats: List[Dict], all_costs: List[Dict]) -> None:
+    """
+    Print EOQ recommendations to console with real costs and stockout data
+    """
+
+    print(f"\n{'='*260}")
+    print(f"{'🎯 EOQ OPTIMAL ORDER QUANTITY ANALYSIS WITH REAL COSTS & STOCKOUT':^260}")
+    print(f"{'='*260}\n")
+
+    print(f"{'Code':<10} {'Material':<20} {'Total Cost':>15} {'Holding Cost':>15} {'Ordering Cost':>15} "
+          f"{'Stockout Cost':>15} {'Annual Cost':>15} {'Stockout Units':>15} {'Stockout Days':>12} {'EOQ':>10}")
+    print(f"{'-'*260}")
+
+    for stat in sorted(all_stats, key=lambda x: x["annual_demand"], reverse=True):
+        cost = next((c for c in all_costs if c["material_code"] == stat["material_code"]), None)
+        if cost:
+            print(f"{stat['material_code']:<10} {stat['material_name']:<20} "
+                  f"{stat['currency']}{cost['total_cost']:>14,.2f} {stat['currency']}{cost['total_holding_cost']:>14,.2f} "
+                  f"{stat['currency']}{cost['total_ordering_cost']:>14,.2f} {stat['currency']}{cost['total_stockout_cost']:>14,.2f} "
+                  f"{stat['currency']}{cost['annual_cost']:>14,.2f} {cost['total_stockout_units']:>15,.0f} "
+                  f"{cost['stockout_days']:>12} {stat['eoq']:>10,.0f}")
+
+    print(f"{'-'*260}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print(f"\n{'='*100}")
+    print(f"{'📦 EOQ ANALYSIS FROM ForecastEOQ FILE WITH REAL COSTS & STOCKOUT':^100}")
+    print(f"{'='*100}\n")
+
+    all_stats = []
+    all_costs = []
+
+    for idx, material_code in enumerate(MATERIAL_CODES, 1):
+        try:
+            print(f"[{idx}/{len(MATERIAL_CODES)}] 📥 Loading material {material_code}...")
+
+            # Load data
+            df, metadata = load_material_data(EXCEL_FILE, material_code)
+
+            if df is None or metadata is None:
+                print(f"⚠️  Skipping material {material_code}!\n")
+                continue
+
+            # Calculate real inventory
+            df = calculate_real_inventory(df)
+
+            # Calculate statistics
+            stats = calculate_statistics(df, metadata)
+            all_stats.append(stats)
+
+            # Calculate real inventory costs
+            df, cost_summary = calculate_real_inventory_costs(df, metadata)
+            all_costs.append(cost_summary)
+
+            print(f"     ✅ EOQ: {stats['eoq']:.0f} | ROP: {stats['rop']:.0f} | "
+                  f"Total Cost: {stats['currency']}{cost_summary['total_cost']:,.2f}")
+            if cost_summary['total_stockout_cost'] > 0:
+                print(f"     ⚠️  STOCKOUT: {cost_summary['total_stockout_units']:.0f} units on {cost_summary['stockout_days']} days | Cost: {stats['currency']}{cost_summary['total_stockout_cost']:,.2f}")
+
+            # Export inventory cost data to Excel & CSV
+            print(f"     📊 Exporting inventory cost data...")
+            export_inventory_cost_data(df, cost_summary, OUTPUT_DIR)
+
+            # EOQ Graph
+            print(f"     🎨 Creating EOQ graph...")
+            create_eoq_graph(df, stats, cost_summary,
+                           f"{OUTPUT_DIR}01_forecast_eoq_sawtooth_{material_code}_{stats['material_name'].replace(' ', '_')}.png")
+
+            # Cost Graph
+            print(f"     💰 Creating cost graph...")
+            create_eoq_cost_graph(stats, cost_summary,
+                                f"{OUTPUT_DIR}02_forecast_eoq_cost_{material_code}_{stats['material_name'].replace(' ', '_')}.png")
+
+            print()
+
+        except Exception as e:
+            print(f"❌ ERROR: {material_code} → {str(e)}\n")
+            continue
+
+    # Summary table
+    if all_stats and all_costs:
+        print(f"\n📊 Creating summary table...")
+        create_summary_table(all_stats, all_costs, f"{OUTPUT_DIR}eoq_forecast_summary.xlsx")
+
+        # Console report
+        print_console_report(all_stats, all_costs)
+
+        print(f"{'='*100}")
+        print(f"✅ ALL ANALYSIS COMPLETED!")
+        print(f"{'='*100}\n")
+    else:
+        print(f"❌ No data loaded!")
+
+
+if __name__ == "__main__":
+    main()
