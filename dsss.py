@@ -5,8 +5,9 @@ import warnings
 import math
 import itertools
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from scipy import stats
+from scipy.stats import norm
+from dataclasses import dataclass
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from xgboost import XGBRegressor
 from catboost import CatBoostRegressor
@@ -17,10 +18,12 @@ warnings.filterwarnings("ignore")
 # =============================================================================
 # CONSTANTS & CONFIGURATIONS
 # =============================================================================
+SERVICE_LEVEL = 0.95
 ORDERING_COST = 2792.0       
 HOLDING_COST_PCT = 0.25      
-SERVICE_LEVEL = 0.95         
 STOCKOUT_COST_PER_UNIT = 150.0 
+SIMULATION_DAYS = 365
+DEFAULT_LEAD_TIME_DAYS = 7
 
 # Forecast Configuration Constraints
 DATE_COL = "Date"
@@ -34,11 +37,14 @@ AUTO_SELECT = False
 N_LAGS = 14
 ROLL_WINDOWS = (7, 14, 30)
 
-SHORT_NAMES = {
-    600080: "MOTORIN", 600096: "TOKA 32", 600102: "ÇEMBER TOKA",
-    600112: "SIYAH ÇEMBER", 603789: "ELDİVEN", 603812: "KULAK TIKACI",
-    607290: "Ç.4140", 626100: "SAPAN", 627518: "BRK 77x60", 627519: "BRK 80x122"
-}
+@dataclass
+class MaterialItem:
+    code: str
+    name: str
+    mean_daily: float
+    std_daily: float
+    distribution: str = "gamma"
+    lead_time_days: int = DEFAULT_LEAD_TIME_DAYS
 
 # =============================================================================
 # 1. DATA LOADING & STRUCTURAL INTEGRATION
@@ -233,7 +239,7 @@ def build_comparison(test, sarima_pred, lo, hi, xgb_pred, cat_pred) -> pd.DataFr
     return out
 
 # =============================================================================
-# 4. ABC – XYZ MATERIAL ANALYSIS
+# 4. ABC – XYZ ANALYSIS
 # =============================================================================
 def abc_analysis(monthly_dict):
     records = []
@@ -263,71 +269,131 @@ def xyz_analysis(monthly_dict):
     return pd.DataFrame(records, columns=["Material", "Description", "Mean", "Std", "CV", "XYZ"])
 
 # =============================================================================
-# 5. INVENTORY ENGINE MATRIX LOGIC (ARDIŞIK BESLEME REVIZYONU)
+# 5. INVENTORY LOGIC (SIMULATION BASED & FORECAST-DRIVEN)
 # =============================================================================
-def calculate_real_inventory(df):
-    df = df.copy()
-    df["Envanter"] = 0.0
-    df["Stockout"] = 0.0
-    current_inv = 0.0
-    inventory_list = []
-    stockout_list = []
-
-    for idx, row in df.iterrows():
-        current_inv = current_inv + row["Inflow"] - row["Quantity"]
-        if current_inv < 0:
-            stockout_list.append(-current_inv)
-            current_inv = 0.0
-        else:
-            stockout_list.append(0.0)
-        inventory_list.append(current_inv)
-
-    df["Envanter"] = inventory_list
-    df["Stockout"] = stockout_list
-    return df
-
-def calculate_real_inventory_costs(df, unit_price, order_cost, hold_pct, stockout_cost):
-    df = df.copy()
-    daily_holding_cost_rate = hold_pct / 365.0
-    df["Holding_Cost_Daily"] = df["Envanter"] * daily_holding_cost_rate * unit_price
-    df["Is_Order"] = df["Inflow"] > 0
-    df["Ordering_Cost_Daily"] = df["Is_Order"].astype(float) * order_cost
-    df["Stockout_Cost_Daily"] = df["Stockout"] * stockout_cost
-    df["Total_Cost_Daily"] = df["Holding_Cost_Daily"] + df["Ordering_Cost_Daily"] + df["Stockout_Cost_Daily"]
-    return df
-
-# REVISED: Envanteri tahmin sonuçlarından (Forecast) besleyecek şekilde değiştirildi.
-def calculate_eoq_rop_stats_from_forecast(forecast_series, unit_price, order_cost, hold_pct, service_level, lead_time_days):
-    forecast_values = forecast_series.values
-    days = len(forecast_values)
-    total_forecast_consumption = forecast_values.sum()
-    avg_daily_consumption = total_forecast_consumption / days if days > 0 else 0
-
-    std_daily = forecast_values.std() if days > 1 else avg_daily_consumption * 0.3
-    cv = (std_daily / avg_daily_consumption * 100) if avg_daily_consumption > 0 else 0
-
-    annual_demand = avg_daily_consumption * 365.0
-    holding_cost_val = hold_pct * unit_price
-
-    if annual_demand > 0 and holding_cost_val > 0:
-        eoq = math.sqrt((2.0 * annual_demand * order_cost) / holding_cost_val)
-    else:
-        eoq = avg_daily_consumption * 30.0
-    eoq = max(1.0, eoq)
-
-    lt_mean = avg_daily_consumption * lead_time_days
+def calculate_reorder_point(mean_daily: float, std_daily: float, lead_time_days: int, service_level: float) -> float:
+    if mean_daily <= 0:
+        return 0.0
+    lt_mean = mean_daily * lead_time_days
     lt_std = std_daily * math.sqrt(lead_time_days)
-    z = stats.norm.ppf(service_level)
-    rop = max(0.0, lt_mean + z * lt_std)
+    try:
+        z = norm.ppf(service_level)
+        return max(0.0, lt_mean + z * lt_std)
+    except Exception:
+        return max(0.0, lt_mean)
 
-    return {
-        "avg_daily_consumption": avg_daily_consumption,
-        "std_daily": std_daily,
-        "cv_percent": cv,
-        "eoq": eoq,
-        "rop": rop,
-        "annual_demand": annual_demand
+def calculate_eoq(mean_daily: float, ordering_cost: float, holding_cost_pct: float, unit_cost: float) -> float:
+    if mean_daily <= 0:
+        return 1.0
+    annual_demand = mean_daily * 365.0
+    holding_cost = holding_cost_pct * unit_cost
+    if holding_cost <= 0 or annual_demand <= 0:
+        return max(mean_daily * 30.0, 1.0)
+    try:
+        eoq = math.sqrt((2.0 * annual_demand * ordering_cost) / holding_cost)
+        return max(1.0, eoq)
+    except Exception:
+        return max(mean_daily * 30.0, 1.0)
+
+def _generate_daily_demand(mean_daily: float, std_daily: float, distribution: str, day: int) -> float:
+    day_factor = 0.8 if day % 7 in [5, 6] else 1.0
+    spike = np.random.gamma(2, 10) if np.random.random() < 0.05 else 0.0
+
+    if distribution == "normal":
+        base = max(0.0, np.random.normal(mean_daily, std_daily))
+    elif distribution == "gamma":
+        if std_daily <= 0 or mean_daily <= 0:
+            base = mean_daily
+        else:
+            shape = (mean_daily ** 2) / (std_daily ** 2)
+            scale = (std_daily ** 2) / mean_daily
+            base = np.random.gamma(shape=shape, scale=scale)
+    elif distribution == "lognormal":
+        if std_daily <= 0 or mean_daily <= 0:
+            base = mean_daily
+        else:
+            sigma = np.sqrt(np.log((std_daily ** 2 / mean_daily ** 2) + 1))
+            mu = np.log(mean_daily) - (sigma ** 2) / 2
+            base = np.random.lognormal(mean=mu, sigma=sigma)
+    else:
+        base = mean_daily
+
+    return max(0.0, base * day_factor + spike)
+
+def simulate_inventory_with_real_data(item: MaterialItem, reorder_point: float, order_qty: float, simulation_days: int = SIMULATION_DAYS):
+    daily_demands = [
+        _generate_daily_demand(item.mean_daily, item.std_daily, item.distribution, day)
+        for day in range(simulation_days)
+    ]
+
+    inventory_history = []
+    demand_history = []
+    order_history = []
+    pending_orders = []
+
+    current_inventory = order_qty
+    total_demand = 0.0
+    total_shortage = 0.0
+    total_fulfilled = 0.0
+    stockout_days = 0
+
+    for day in range(simulation_days):
+        received = 0
+        still_pending = []
+        for arrival_day, qty in pending_orders:
+            if day >= arrival_day:
+                received += qty
+            else:
+                still_pending.append((arrival_day, qty))
+        pending_orders = still_pending
+        current_inventory += received
+
+        demand = daily_demands[day]
+        total_demand += demand
+        demand_history.append(demand)
+
+        if current_inventory >= demand:
+            fulfilled = demand
+            current_inventory -= fulfilled
+            total_fulfilled += fulfilled
+        else:
+            fulfilled = current_inventory
+            shortage = demand - fulfilled
+            current_inventory = -shortage
+            total_shortage += shortage
+            stockout_days += 1
+            total_fulfilled += fulfilled
+
+        if current_inventory <= reorder_point and len(pending_orders) == 0:
+            arrival_day = day + item.lead_time_days
+            pending_orders.append((arrival_day, order_qty))
+            order_history.append((day, order_qty))
+
+        inventory_history.append(current_inventory)
+
+    inv_arr = np.array(inventory_history, dtype=float)
+    fill_rate = (total_fulfilled / total_demand * 100) if total_demand > 0 else 0.0
+
+    result = {
+        "avg_inventory": float(inv_arr[inv_arr >= 0].mean()) if np.any(inv_arr >= 0) else 0.0,
+        "min_inventory": float(inv_arr.min()) if len(inv_arr) > 0 else 0.0,
+        "max_inventory": float(inv_arr.max()) if len(inv_arr) > 0 else 0.0,
+        "total_demand": total_demand,
+        "total_shortage": total_shortage,
+        "stockout_days": stockout_days,
+        "fill_rate": fill_rate,
+        "reorder_point": reorder_point,
+        "order_quantity": order_qty,
     }
+
+    history = {
+        "days": list(range(simulation_days)),
+        "inventory": inventory_history,
+        "demand": demand_history,
+        "orders": order_history,
+    }
+
+    return result, history
 
 def color_abc_xyz(val):
     colors = {"A": "#4CAF50", "B": "#FFC107", "C": "#F44336",
@@ -383,7 +449,7 @@ product_df["t"] = np.arange(1, len(product_df) + 1)
 train_frame = product_df[product_df["Date"] < cutoff_dt].reset_index(drop=True)
 test_frame = product_df[product_df["Date"] >= cutoff_dt].reset_index(drop=True)
 
-# CORE REVISION: Calculate forecast models early so metrics can feed the inventory logic dynamically
+# CORE ARDIŞIK ENTEGRASYON: Tahmin modelini sekmelerden önce çalıştırıp en başarılısını buluyoruz
 has_valid_forecast = False
 if len(train_frame) >= N_LAGS and len(test_frame) > 0:
     y_train_series = pd.Series(train_frame[VALUE_COL].values, index=pd.RangeIndex(1, len(train_frame) + 1))
@@ -412,23 +478,29 @@ if len(train_frame) >= N_LAGS and len(test_frame) > 0:
         "CatBoost": error_stats(comp_df["Actual"], comp_df["CatBoost"]),
     }
     
-    # CRITICAL DEPENDENCY LINK: Find the model with lowest MAE and select its forecast to feed inventory block [cite: 184, 218]
+    # MAE'ye göre en başarılı modeli seçiyoruz
     maes = {"SARIMA": stats_dict["SARIMA"][0], "XGBoost": stats_dict["XGBoost"][0], "CatBoost": stats_dict["CatBoost"][0]}
     best_model_name = min(maes, key=maes.get)
-    comp_df["Best_Forecast"] = comp_df[best_model_name]
+    best_forecast_series = comp_df[best_model_name]
     has_valid_forecast = True
 
-# UI Tabs Mapping
+# UI Tabs Layout
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊 EDA & Data Sample", "🧮 ABC–XYZ Matrix", "📈 Advanced Forecasting", 
-    "💸 Real Cost & Inventory", "⏳ Daily Time Series", "📋 Summary Dashboard"
+    "📦 Inventory Simulation", "⏳ Daily Time Series", "📋 Summary Dashboard"
 ])
 
+# -------------------------
+# TAB 1 — EDA
+# -------------------------
 with tab1:
     st.header("📊 Exploratory Data Analysis & Structure")
     st.dataframe(df.head(10))
     st.metric("Total Records Ingested", f"{len(df):,}")
 
+# -------------------------
+# TAB 2 — ABC–XYZ
+# -------------------------
 with tab2:
     st.header("🧮 ABC–XYZ Matrix Analytics")
     df_abc = abc_analysis(monthly)
@@ -461,7 +533,7 @@ with tab3:
         st.warning(f"Data configuration criteria not met for forecast loops.")
     else:
         st.write(f"**Execution Profile:** Training Days: `{len(train_frame)}` | Testing Days Evaluation Window: `{len(test_frame)}`")
-        st.info(f"🏆 **Automated Model Selector:** **{best_model_name}** has the lowest MAE error profile. Its parameters are dispatched to feed the Inventory matrix step seamlessly.")
+        st.info(f"🏆 **Dinamik Model Seçici:** En düşük MAE değerine sahip **{best_model_name}** modeli otomatik olarak kazandı ve Envanter simülasyonunu beslemek üzere atandı.")
         
         accuracy_df = pd.DataFrame({
             "Model Specification": [f"SARIMA{order}{sorder[:3]} s={sorder[3]}", "XGBoost Regressor", "CatBoost Regressor"],
@@ -494,107 +566,139 @@ with tab3:
         plt.close()
 
 # =============================================================================
-# TAB 4 — REAL COSTS & INVENTORY BALANCE TRACKING (DEPENDENCY SOLVED)
+# TAB 4 — INVENTORY OPTIMIZATION (TAHMİN BESLEMELİ SİMÜLASYON)
 # =============================================================================
 with tab4:
-    st.header("💸 Real Material Flows, Costs & Stockout Matrix")
-    
-    col_p1, col_p2 = st.columns(2)
-    with col_p1:
-        ui_unit_price = st.number_input("Unit Price (Material Base Cost)", min_value=0.1, max_value=50000.0, value=10.0, step=1.0)
-        ui_order_cost = st.number_input("Ordering Setup Cost (Fixed)", min_value=1.0, max_value=100000.0, value=float(ORDERING_COST), step=10.0)
-    with col_p2:
-        ui_hold_pct = st.slider("Holding Cost Rate (Annualized %)", 0.01, 1.0, float(HOLDING_COST_PCT), step=0.01)
-        ui_stockout_cost = st.number_input("Penalty/Stockout Cost Per Unit Shortage", min_value=0.0, max_value=5000.0, value=float(STOCKOUT_COST_PER_UNIT), step=1.0)
-        
-    ui_lead_time = st.number_input("Lead Time Duration (Days)", min_value=1, max_value=90, value=int(7), step=1)
-    
-    calculated_df = calculate_real_inventory(product_df)
-    cost_df = calculate_real_inventory_costs(calculated_df, ui_unit_price, ui_order_cost, ui_hold_pct, ui_stockout_cost)
-    
-    # SYSTEM LINK UP: If forecast is ready, calculate targets using the prediction dataset metrics [cite: 184, 201]
+    st.header("📦 Inventory Optimization — Forecast-Driven Simulation")
+
+    # BAĞIMLI DEĞİŞKENLER: Parametre hesaplamaları en iyi modelin tahmin serisinden türetilir
     if has_valid_forecast:
-        inv_stats = calculate_eoq_rop_stats_from_forecast(comp_df["Best_Forecast"], ui_unit_price, ui_order_cost, ui_hold_pct, SERVICE_LEVEL, ui_lead_time)
-        st.caption(f"💡 **Data-Link Active:** Target optimizations calculated over upcoming demand projections using **{best_model_name}** pipelines.")
+        mean_daily = float(best_forecast_series.mean())
+        std_daily = float(best_forecast_series.std())
+        st.caption(f"💡 **Veri Bağlantısı Aktif:** Envanter optimizasyon parametreleri, geleceğe yönelik en başarılı tahmin modelinden (**{best_model_name}**) dinamik olarak beslenmektedir.")
     else:
-        inv_stats = calculate_eoq_rop_stats_from_forecast(product_df["Quantity"], ui_unit_price, ui_order_cost, ui_hold_pct, SERVICE_LEVEL, ui_lead_time)
-        st.caption("⚠️ **Data-Link Fallback:** Optimization using historical mean logs due to insufficient forecast runtime windows.")
-        
-    total_h = cost_df["Holding_Cost_Daily"].sum()
-    total_o = cost_df["Ordering_Cost_Daily"].sum()
-    total_s = cost_df["Stockout_Cost_Daily"].sum()
-    grand_total = total_h + total_o + total_s
-    
-    mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric("Total Holding Cost Flow", f"TRY {total_h:,.2f}")
-    mc2.metric("Total Ordering Setup Cost", f"TRY {total_o:,.2f}")
-    mc3.metric("Stockout Financial Impact", f"TRY {total_s:,.2f}", delta=f"{cost_df['Stockout'].sum():.0f} Units Short", delta_color="inverse")
-    mc4.metric("Grand Operation Cost", f"TRY {grand_total:,.2f}")
-    
-    st.markdown("---")
-    
-    col_m1, col_m2 = st.columns(2)
-    with col_m1:
-        st.subheader("Calculated Optimization Targets (EOQ - ROP)")
-        st.metric("Economic Order Quantity (EOQ Optimal Q*)", f"{inv_stats['eoq']:.2f} Units")
-        st.metric("Safety Reorder Point (ROP)", f"{inv_stats['rop']:.2f} Units")
-        st.metric("Coefficient of Variation (CV %)", f"{inv_stats['cv_percent']:.1f}%")
-        
-    with col_m2:
-        st.subheader("Operational Trajectory Realizations")
-        st.metric("Average Daily Predicted Sales Demand", f"{inv_stats['avg_daily_consumption']:.2f} Units")
-        st.metric("Stockout Occurrence Days", f"{(cost_df['Stockout'] > 0).sum()} Days")
-        
-    st.subheader("Real Inventory Balance & Safety Bands Over Time")
-    fig_st, ax_st = plt.subplots(figsize=(14, 4.5))
-    days_arr = range(len(cost_df))
-    ax_st.plot(days_arr, cost_df["Envanter"], color="#DC2626", linewidth=2, label="Actual On-Hand Balance Level")
-    ax_st.axhline(y=inv_stats["rop"], color="#16A34A", linestyle="--", label=f"Optimal Forecast-Based ROP Line ({inv_stats['rop']:.1f})")
-    ax_st.axhline(y=inv_stats["eoq"], color="#D97706", linestyle="-.", label=f"Optimal Forecast-Based EOQ Line ({inv_stats['eoq']:.1f})")
-    ax_st.fill_between(days_arr, 0, inv_stats["rop"], alpha=0.05, color="#16A34A", label="Safety Stock Band")
-    ax_st.set_xlabel("Day Progress")
-    ax_st.set_ylabel("Quantity Units")
-    ax_st.legend(loc="upper right")
-    ax_st.grid(alpha=0.2)
-    st.pyplot(fig_st)
-    plt.close()
+        mean_monthly = monthly[selected_key].mean()
+        std_monthly = monthly[selected_key].std()
+        mean_daily = mean_monthly / 30.0 if mean_monthly > 0 else 0.0
+        std_daily = std_monthly / 30.0 if std_monthly > 0 else 0.0
+        st.caption("⚠️ **Veri Bağlantısı Yedek Modda:** Yetersiz tahmin verisi sebebiyle geçmiş ham veri ortalamaları kullanılmaktadır.")
 
-    st.subheader("Daily Accumulative Cost Layer Analysis")
-    fig_c, ax_c = plt.subplots(figsize=(14, 4))
-    ax_c.fill_between(days_arr, 0, cost_df["Holding_Cost_Daily"], alpha=0.6, color="#16A34A", label="Holding Allocation")
-    ax_c.fill_between(days_arr, cost_df["Holding_Cost_Daily"], cost_df["Holding_Cost_Daily"] + cost_df["Ordering_Cost_Daily"], alpha=0.6, color="#D97706", label="Ordering Allocation")
-    ax_c.fill_between(days_arr, cost_df["Holding_Cost_Daily"] + cost_df["Ordering_Cost_Daily"], cost_df["Total_Cost_Daily"], alpha=0.6, color="#EF4444", label="Penalty Stockout Allocation")
-    ax_c.set_ylabel("TRY Value")
-    ax_c.set_xlabel("Day Progress")
-    ax_c.legend(loc="upper left")
-    ax_c.grid(alpha=0.2)
-    st.pyplot(fig_c)
-    plt.close()
+    col_left, col_right = st.columns([1, 1.4])
 
-# =============================================================================
-# TAB 5 — DAILY TIME SERIES
-# =============================================================================
+    with col_left:
+        st.subheader("Simulation Parameters")
+        service = st.slider("Service Level", 0.80, 0.999, float(SERVICE_LEVEL))
+        lt = st.number_input("Lead Time (days)", 1, 60, int(DEFAULT_LEAD_TIME_DAYS))
+        order_cost = st.number_input("Order Cost", 1.0, 10000.0, float(ORDERING_COST))
+        hold_pct = st.number_input("Holding Cost Rate", 0.01, 1.0, float(HOLDING_COST_PCT))
+        unit_cost = st.number_input("Unit Cost", 0.1, 1000.0, float(10.0)) # Cast to float
+
+        if mean_daily <= 0:
+            st.warning("Not enough demand data to compute inventory metrics.")
+            result = None
+            history = None
+        else:
+            item = MaterialItem(
+                code=str(p_code),
+                name=str(p_desc),
+                mean_daily=mean_daily,
+                std_daily=std_daily,
+                distribution="gamma",
+                lead_time_days=int(lt),
+            )
+
+            rop = calculate_reorder_point(item.mean_daily, item.std_daily, item.lead_time_days, service)
+            eoq = calculate_eoq(item.mean_daily, order_cost, hold_pct, unit_cost)
+
+            st.subheader("Key Forecast-Based Metrics")
+            st.metric("Reorder Point (ROP Target)", f"{rop:.1f} Units")
+            st.metric("Economic Order Quantity (EOQ Target Q*)", f"{eoq:.1f} Units")
+            st.metric("Predicted Daily Mean Demand", f"{item.mean_daily:.2f}")
+            st.metric("Predicted Daily Std Dev", f"{item.std_daily:.2f}")
+
+            st.markdown("---")
+            st.subheader("Simulation Operational Run Results")
+            result, history = simulate_inventory_with_real_data(item, rop, eoq)
+
+            colm1, colm2 = st.columns(2)
+            colm1.metric("Avg Inventory (>=0)", f"{result['avg_inventory']:.1f}")
+            colm2.metric("Min Inventory", f"{result['min_inventory']:.1f}")
+            colm3, colm4 = st.columns(2)
+            colm3.metric("Max Inventory", f"{result['max_inventory']:.1f}")
+            colm4.metric("Fill Rate", f"{result['fill_rate']:.1f}%")
+            colm5, colm6 = st.columns(2)
+            colm5.metric("Stockout Days Triggers", f"{result['stockout_days']} Days")
+            colm6.metric("Total Shortage Vol", f"{result['total_shortage']:.1f} Units")
+
+    with col_right:
+        if mean_daily <= 0 or result is None or history is None:
+            st.info("Inventory plots will appear here once simulation calculation completes successfully.")
+        else:
+            st.subheader("Simulated Dynamic Inventory & Predicted Demand Over Time")
+
+            days_axis = history["days"]
+            inv_level = history["inventory"]
+            sim_demand = history["demand"]
+
+            fig1, ax1 = plt.subplots(figsize=(8, 4))
+            ax1.plot(days_axis, inv_level, label="Inventory Level State", color="#DC2626", linewidth=1.8)
+            ax1.axhline(0, color="black", linewidth=1, linestyle="--", alpha=0.5)
+            ax1.axhline(result["reorder_point"], color="#16A34A", linestyle="--", linewidth=1.5, label=f"ROP ({result['reorder_point']:.1f})")
+            ax1.set_xlabel("Day Progress")
+            ax1.set_ylabel("Inventory Balance")
+            ax1.set_title(f"Dynamic Saw-Tooth Inventory Trajectory - Material: {p_code}")
+            ax1.legend()
+            ax1.grid(alpha=0.3)
+            st.pyplot(fig1)
+            plt.close(fig1)
+
+            fig2, ax2 = plt.subplots(figsize=(8, 3))
+            ax2.plot(days_axis, sim_demand, color="#2563EB", linewidth=1.5)
+            ax2.set_xlabel("Day Progress")
+            ax2.set_ylabel("Simulated Short Horizon Demand")
+            ax2.set_title("Forecast-Driven Daily Demand Pattern (Simulated Execution)")
+            ax2.grid(alpha=0.3)
+            st.pyplot(fig2)
+            plt.close(fig2)
+
+            fig3, ax3 = plt.subplots(figsize=(8, 3))
+            ax3.hist(sim_demand, bins=30, color="#0EA5E9", alpha=0.8, edgecolor="white")
+            ax3.set_xlabel("Demand Size Category")
+            ax3.set_ylabel("Frequency Hit Metrics")
+            ax3.set_title("Forecast Density Spread (Simulated Frequency Distribution)")
+            st.pyplot(fig3)
+            plt.close(fig3)
+
+# -------------------------
+# TAB 5 — TIME SERIES
+# -------------------------
 with tab5:
     st.header("⏳ Baseline Historical Time Series Data")
     st.line_chart(product_df.set_index("Date")["Quantity"])
 
 # =============================================================================
-# TAB 6 — CONTROL SUMMARY DASHBOARD
+# TAB 6 — SUMMARY CONTROL BOARD
 # =============================================================================
 with tab6:
     st.header("📋 Executive Summary Control Board")
-    db_col1, db_col2 = st.columns(2)
-    with db_col1:
+
+    if not monthly:
+        st.info("Dashboard summary blocks are currently locked.")
+    else:
         st.subheader("Product Profiler Metadata")
-        st.markdown(f"""
-        - **Target Inventory Code:** `{p_code}`
-        - **Description Tag:** `{p_desc}`
-        - **Calculated Prediction-Based Annual Demand:** `{inv_stats['annual_demand']:,.0f} Units`
-        - **Assigned Procurement Lead Time:** `{ui_lead_time} Days`
-        """)
-    with db_col2:
-        st.subheader("Target Recommendation Engine")
-        st.success(f"**Recommended Batch Size (Q*):** {inv_stats['eoq']:.0f} Units")
-        st.success(f"**Recommended Trigger Threshold (ROP):** {inv_stats['rop']:.0f} Units")
+        st.write(f"**Target Material Code:** `{p_code}`")
+        st.write(f"**Description Tag:** `{p_desc}`")
+
+        st.subheader("Historical Demand Baseline Overview")
+        st.line_chart(product_df.set_index("Date")["Quantity"])
+
         if has_valid_forecast:
-            st.caption(f"🎯 *Note:* These metrics are dynamically powered by your most accurate machine learning projection path (**{best_model_name}**)[cite: 184, 218].")
+            st.subheader("Deployable Optimization Recommendations")
+            st.success(f"🎯 **Best-Performing Model Asset Identified:** `{best_model_name}`")
+            
+            sc1, sc2 = st.columns(2)
+            sc1.metric("Recommended Batch Size (Optimal Q*)", f"{eoq:.0f} Units")
+            sc2.metric("Recommended Trigger Point (Optimal ROP)", f"{rop:.0f} Units")
+            
+            st.metric("Forecast-Based Daily Average Sales Demand", f"{mean_daily:.2f} Units/Day")
+            st.metric("Calculated Baseline Service Level Policy Target", f"{service * 100:.1f}%")
