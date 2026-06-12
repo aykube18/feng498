@@ -12,14 +12,12 @@ from scipy.stats import norm
 from dataclasses import dataclass
 import math
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 
 # =============================================================================
-# 1. DATA LOADING - ESKİ VE YENİ METHODLAR
-# =============================================================================
+# 1. DATA LOADING
+# ============================================================================
 
 def load_file(uploaded_file):
-    """Eski system: CSV/Excel dosya yükleme"""
     if uploaded_file is None:
         return None
     if uploaded_file.name.endswith(".csv"):
@@ -27,41 +25,7 @@ def load_file(uploaded_file):
     else:
         return pd.read_excel(uploaded_file)
 
-def load_material_data_from_excel(filepath: str, material_code: int, sheet_name=None):
-    """
-    YENİ SYSTEM: ForecastEOQ.xlsx formatından veri yükleme
-    Columns: Tarih, Mal Giriş, Tüketim Miktarı, Unit Price, Para Birimi, Lead time
-    """
-    try:
-        if sheet_name is None:
-            sheet_name = str(material_code)
-        
-        df = pd.read_excel(filepath, sheet_name=sheet_name)
-        df.columns = df.columns.str.strip()
-        df["Tarih"] = pd.to_datetime(df["Tarih"])
-        df = df.sort_values("Tarih").reset_index(drop=True)
-        df["Mal Giriş"] = df["Mal Giriş"].fillna(0)
-        df["Tüketim Miktarı"] = df["Tüketim Miktarı"].fillna(0)
-
-        unit_price = float(df["Unit Price"].iloc[0]) if "Unit Price" in df.columns else 1.0
-        currency = str(df["Para Birimi"].iloc[0]) if "Para Birimi" in df.columns else "TRY"
-        lead_time = int(df["Lead time"].iloc[0]) if "Lead time" in df.columns else 2
-
-        metadata = {
-            "unit_price": unit_price,
-            "currency": currency,
-            "lead_time": lead_time,
-            "material_code": material_code,
-        }
-
-        return df, metadata
-
-    except Exception as e:
-        st.warning(f"Error loading material {material_code}: {str(e)}")
-        return None, None
-
 def clean_raw(df):
-    """Eski system: Veri temizleme"""
     rename_map = {
         "Malzeme": "Material",
         "Malzeme kısa metni": "Description",
@@ -79,7 +43,7 @@ def clean_raw(df):
     return df
 
 # =============================================================================
-# 2. AGGREGATION FUNCTIONS - ESKİ SYSTEM
+# 2. AGGREGATION FUNCTIONS
 # =============================================================================
 
 def get_monthly(df):
@@ -109,7 +73,7 @@ def get_weekly(df):
     return result
 
 # =============================================================================
-# 3. FORECAST MODELS - ESKİ SYSTEM
+# 3. FORECAST MODELS
 # =============================================================================
 
 def arima_forecast(series, horizon=6):
@@ -169,7 +133,7 @@ def ml_forecast(series, model_type="xgboost"):
     return y_test, preds, mae, rmse
 
 # =============================================================================
-# 4. ABC – XYZ ANALYSIS - ESKİ SYSTEM
+# 4. ABC – XYZ ANALYSIS
 # =============================================================================
 
 def abc_analysis(monthly_dict):
@@ -224,20 +188,191 @@ def xyz_analysis(monthly_dict):
     return df
 
 # =============================================================================
-# 5. YENİ INVENTORY SYSTEM - REAL DATA BASED
+# 5. INVENTORY LOGIC (REAL DATA BASED) - YENİ
 # =============================================================================
 
 SERVICE_LEVEL = 0.95
-ORDERING_COST = 2792.0
+ORDERING_COST = 2000.0
 HOLDING_COST_PCT = 0.25
-STOCKOUT_COST_PER_UNIT = 500.0
+UNIT_COST = 1.0
+SIMULATION_DAYS = 365
 DEFAULT_LEAD_TIME_DAYS = 7
+STOCKOUT_COST_PER_UNIT = 500.0
+
+@dataclass
+class MaterialItem:
+    code: str
+    name: str
+    mean_daily: float
+    std_daily: float
+    distribution: str = "gamma"
+    lead_time_days: int = DEFAULT_LEAD_TIME_DAYS
+
+def calculate_reorder_point(mean_daily: float, std_daily: float,
+                            lead_time_days: int,
+                            service_level: float,
+                            distribution: str = "normal") -> float:
+    if mean_daily <= 0:
+        return 0.0
+    lt_mean = mean_daily * lead_time_days
+    lt_std = std_daily * math.sqrt(lead_time_days)
+    try:
+        z = norm.ppf(service_level)
+        return max(0.0, lt_mean + z * lt_std)
+    except Exception:
+        return max(0.0, lt_mean)
+
+def calculate_eoq(mean_daily: float,
+                  ordering_cost: float = ORDERING_COST,
+                  holding_cost_pct: float = HOLDING_COST_PCT,
+                  unit_cost: float = UNIT_COST) -> float:
+    if mean_daily <= 0:
+        return 1.0
+    annual_demand = mean_daily * 365
+    holding_cost = holding_cost_pct * unit_cost
+    if holding_cost <= 0 or annual_demand <= 0:
+        return max(mean_daily * 30, 1)
+    try:
+        eoq = math.sqrt((2 * annual_demand * ordering_cost) / holding_cost)
+        return max(1.0, eoq)
+    except Exception:
+        return max(mean_daily * 30, 1)
+
+def _generate_daily_demand(mean_daily: float, std_daily: float,
+                           distribution: str, day: int) -> float:
+    day_factor = 0.8 if day % 7 in [5, 6] else 1.0
+    spike = np.random.gamma(2, 10) if np.random.random() < 0.05 else 0.0
+
+    if distribution == "normal":
+        base = max(0.0, np.random.normal(mean_daily, std_daily))
+    elif distribution == "gamma":
+        if std_daily <= 0 or mean_daily <= 0:
+            base = mean_daily
+        else:
+            shape = (mean_daily ** 2) / (std_daily ** 2)
+            scale = (std_daily ** 2) / mean_daily
+            base = np.random.gamma(shape=shape, scale=scale)
+    elif distribution == "lognormal":
+        if std_daily <= 0 or mean_daily <= 0:
+            base = mean_daily
+        else:
+            sigma = np.sqrt(np.log((std_daily ** 2 / mean_daily ** 2) + 1))
+            mu = np.log(mean_daily) - (sigma ** 2) / 2
+            base = np.random.lognormal(mean=mu, sigma=sigma)
+    else:
+        base = mean_daily
+
+    return max(0.0, base * day_factor + spike)
+
+def simulate_inventory_with_real_data(item: MaterialItem,
+                                      reorder_point: float,
+                                      order_qty: float,
+                                      simulation_days: int = SIMULATION_DAYS):
+    daily_demands = [
+        _generate_daily_demand(item.mean_daily, item.std_daily, item.distribution, day)
+        for day in range(simulation_days)
+    ]
+
+    inventory_history = []
+    demand_history = []
+    order_history = []
+    pending_orders = []
+
+    current_inventory = order_qty
+    total_demand = 0.0
+    total_shortage = 0.0
+    total_fulfilled = 0.0
+    stockout_days = 0
+
+    for day in range(simulation_days):
+        received = 0
+        still_pending = []
+        for arrival_day, qty in pending_orders:
+            if day >= arrival_day:
+                received += qty
+            else:
+                still_pending.append((arrival_day, qty))
+        pending_orders = still_pending
+        current_inventory += received
+
+        demand = daily_demands[day]
+        total_demand += demand
+        demand_history.append(demand)
+
+        if current_inventory >= demand:
+            fulfilled = demand
+            current_inventory -= fulfilled
+            total_fulfilled += fulfilled
+        else:
+            fulfilled = current_inventory
+            shortage = demand - fulfilled
+            current_inventory = -shortage
+            total_shortage += shortage
+            stockout_days += 1
+            total_fulfilled += fulfilled
+
+        if current_inventory <= reorder_point and len(pending_orders) == 0:
+            arrival_day = day + item.lead_time_days
+            pending_orders.append((arrival_day, order_qty))
+            order_history.append((day, order_qty))
+
+        inventory_history.append(current_inventory)
+
+    inv_arr = np.array(inventory_history, dtype=float)
+    fill_rate = (total_fulfilled / total_demand * 100) if total_demand > 0 else 0.0
+
+    result = {
+        "avg_inventory": float(inv_arr[inv_arr >= 0].mean()) if np.any(inv_arr >= 0) else 0.0,
+        "min_inventory": float(inv_arr.min()) if len(inv_arr) > 0 else 0.0,
+        "max_inventory": float(inv_arr.max()) if len(inv_arr) > 0 else 0.0,
+        "total_demand": total_demand,
+        "total_shortage": total_shortage,
+        "stockout_days": stockout_days,
+        "fill_rate": fill_rate,
+        "reorder_point": reorder_point,
+        "order_quantity": order_qty,
+    }
+
+    history = {
+        "days": list(range(simulation_days)),
+        "inventory": inventory_history,
+        "demand": demand_history,
+        "orders": order_history,
+    }
+
+    return result, history
+
+# =============================================================================
+# 6. YENİ SYSTEM - REAL DATA INVENTORY
+# =============================================================================
+
+def load_material_data_real(filepath: str, material_code: int):
+    """YENİ: Gerçek envanter verisi yükleme"""
+    try:
+        df = pd.read_excel(filepath, sheet_name=str(material_code))
+        df.columns = df.columns.str.strip()
+        df["Tarih"] = pd.to_datetime(df["Tarih"])
+        df = df.sort_values("Tarih").reset_index(drop=True)
+        df["Mal Giriş"] = df["Mal Giriş"].fillna(0)
+        df["Tüketim Miktarı"] = df["Tüketim Miktarı"].fillna(0)
+
+        unit_price = float(df["Unit Price"].iloc[0]) if "Unit Price" in df.columns else 1.0
+        currency = str(df["Para Birimi"].iloc[0]) if "Para Birimi" in df.columns else "TRY"
+        lead_time = int(df["Lead time"].iloc[0]) if "Lead time" in df.columns else 2
+
+        metadata = {
+            "unit_price": unit_price,
+            "currency": currency,
+            "lead_time": lead_time,
+            "material_code": material_code,
+        }
+
+        return df, metadata
+    except Exception as e:
+        return None, None
 
 def calculate_real_inventory(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    YENİ: Gerçek envanter hesaplaması
-    Envanter = Önceki Envanter + Giriş - Tüketim (negatif değer stok azlığını gösterir)
-    """
+    """YENİ: Gerçek envanter hesaplama"""
     df = df.copy()
     df["Envanter"] = 0.0
     df["Stockout"] = 0.0
@@ -248,36 +383,26 @@ def calculate_real_inventory(df: pd.DataFrame) -> pd.DataFrame:
 
     for idx, row in df.iterrows():
         current_inv = current_inv + row["Mal Giriş"] - row["Tüketim Miktarı"]
-        
         if current_inv < 0:
             stockout_list.append(-current_inv)
         else:
             stockout_list.append(0)
-        
         inventory_list.append(current_inv)
 
     df["Envanter"] = inventory_list
     df["Stockout"] = stockout_list
     return df
 
-def calculate_real_inventory_costs(df: pd.DataFrame, metadata: dict, 
-                                   ordering_cost=ORDERING_COST,
-                                   holding_cost_pct=HOLDING_COST_PCT,
-                                   stockout_cost=STOCKOUT_COST_PER_UNIT):
-    """
-    YENİ: Gerçek envanter maliyetleri
-    - Holding Cost: Günlük Envanter × Günlük Oran × Birim Fiyatı
-    - Ordering Cost: Sipariş Sayısı × Sipariş Maliyeti
-    - Stockout Cost: Stok Azlığı × Birim Başına Maliyet
-    """
+def calculate_real_inventory_costs(df: pd.DataFrame, metadata: dict):
+    """YENİ: Gerçek maliyet hesaplama"""
     df = df.copy()
     unit_price = metadata["unit_price"]
+    daily_holding_cost_rate = HOLDING_COST_PCT / 365
     
-    daily_holding_cost_rate = holding_cost_pct / 365
     df["Holding_Cost_Daily"] = df["Envanter"].clip(lower=0) * daily_holding_cost_rate * unit_price
     df["Is_Order"] = df["Mal Giriş"] > 0
-    df["Ordering_Cost_Daily"] = df["Is_Order"] * ordering_cost
-    df["Stockout_Cost_Daily"] = df["Stockout"] * stockout_cost
+    df["Ordering_Cost_Daily"] = df["Is_Order"] * ORDERING_COST
+    df["Stockout_Cost_Daily"] = df["Stockout"] * STOCKOUT_COST_PER_UNIT
     df["Total_Cost_Daily"] = df["Holding_Cost_Daily"] + df["Ordering_Cost_Daily"] + df["Stockout_Cost_Daily"]
     
     total_holding_cost = df["Holding_Cost_Daily"].sum()
@@ -307,19 +432,13 @@ def calculate_real_inventory_costs(df: pd.DataFrame, metadata: dict,
     
     return df, cost_summary
 
-def calculate_statistics(df: pd.DataFrame, metadata: dict,
-                        ordering_cost=ORDERING_COST,
-                        holding_cost_pct=HOLDING_COST_PCT) -> dict:
-    """
-    YENİ: EOQ ve ROP hesaplaması
-    """
+def calculate_statistics_real(df: pd.DataFrame, metadata: dict) -> dict:
+    """YENİ: İstatistik hesaplama"""
     consumption = df["Tüketim Miktarı"].values
-    inflow = df["Mal Giriş"].values
     inventory = df["Envanter"].values
 
     days = len(df)
     total_consumption = consumption.sum()
-    total_inflow = inflow.sum()
     avg_daily_consumption = total_consumption / days if days > 0 else 0
 
     consumption_nonzero = consumption[consumption > 0]
@@ -329,10 +448,10 @@ def calculate_statistics(df: pd.DataFrame, metadata: dict,
     cv = (std_daily / avg_daily_consumption * 100) if avg_daily_consumption > 0 else 0
 
     annual_demand = avg_daily_consumption * 365
-    holding_cost = holding_cost_pct * metadata["unit_price"]
+    holding_cost = HOLDING_COST_PCT * metadata["unit_price"]
 
     if annual_demand > 0 and holding_cost > 0:
-        eoq = math.sqrt((2 * annual_demand * ordering_cost) / holding_cost)
+        eoq = math.sqrt((2 * annual_demand * ORDERING_COST) / holding_cost)
     else:
         eoq = avg_daily_consumption * 30
 
@@ -348,7 +467,6 @@ def calculate_statistics(df: pd.DataFrame, metadata: dict,
     return {
         "total_days": days,
         "total_consumption": total_consumption,
-        "total_inflow": total_inflow,
         "avg_daily_consumption": round(avg_daily_consumption, 2),
         "std_daily": round(std_daily, 2),
         "cv_percent": round(cv, 1),
@@ -375,422 +493,338 @@ def color_abc_xyz(val):
     return ""
 
 # =============================================================================
-# 7. VISUALIZATION FUNCTIONS - YENİ SYSTEM
+# 7. STREAMLIT UI - ESKİ DESIGN KORUNMUŞ
 # =============================================================================
 
-def create_eoq_graph(df: pd.DataFrame, stats: dict, cost_summary: dict, metadata: dict) -> None:
-    """
-    YENİ: EOQ Testere Dişi Grafiği
-    """
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9))
-    fig.patch.set_facecolor("#F8FAFC")
+st.set_page_config(page_title="DSS", layout="wide")
+st.title("📦 Integrated Decision Support System")
 
-    ax1.set_facecolor("#FFFFFF")
-    days = range(len(df))
+st.header("1️⃣ Data Upload")
+uploaded = st.file_uploader("Upload Excel (xlsx/xls) or CSV", type=["xlsx","xls","csv"])
 
-    ax1.fill_between(days, 0, stats["rop"], alpha=0.08, color="#16A34A", label="Safety Stock Zone")
-    ax1.fill_between(days, 0, df["Envanter"], where=(df["Envanter"] < 0), 
-                     alpha=0.15, color="#EF4444", label="Stockout Zone")
+if uploaded is None:
+    st.info("Please upload a file to continue.")
+    st.stop()
 
-    ax1.plot(days, df["Envanter"], color="#DC2626", linewidth=2.5,
-             label="Inventory Level", marker="o", markersize=2, alpha=0.85, zorder=3)
+df = load_file(uploaded)
+if df is None or df.empty:
+    st.error("Loaded file is empty or invalid.")
+    st.stop()
 
-    ax1.axhline(y=stats["rop"], color="#16A34A", linestyle="--", linewidth=2.5,
-                label=f"ROP = {stats['rop']:.0f}", zorder=2, alpha=0.8)
-    ax1.axhline(y=stats["eoq"], color="#D97706", linestyle="--", linewidth=2,
-                label=f"EOQ = {stats['eoq']:.0f}", zorder=1, alpha=0.6)
-    ax1.axhline(y=stats["avg_inventory"], color="#7C3AED", linestyle=":", linewidth=2.5,
-                label=f"Avg = {stats['avg_inventory']:.0f}", zorder=2, alpha=0.8)
-    ax1.axhline(y=0, color="#000000", linestyle="-", linewidth=1.5, zorder=0, alpha=0.5)
+df = clean_raw(df)
+st.success("Data successfully loaded!")
 
-    ax1.set_xlabel("Days", fontsize=11, fontweight="bold", color="#374151")
-    ax1.set_ylabel("Inventory (units)", fontsize=11, fontweight="bold", color="#374151")
-    ax1.set_title(f"📦 EOQ Analysis: {metadata['material_code']}", fontsize=12, fontweight="bold")
-    ax1.legend(fontsize=9, loc="upper right", framealpha=0.95)
-    ax1.grid(True, alpha=0.25, linestyle="--")
-    ax1.spines[["top", "right"]].set_visible(False)
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["📊 EDA", "🧮 ABC–XYZ", "📈 Forecast", "📦 Inventory", "⏳ Time Series", "📋 Summary Dashboard"]
+)
 
-    info_text = (f"📊 CONFIG\nCode: {metadata['material_code']}\n"
-                f"Lead Time: {metadata['lead_time']}d\nUnit Price: {metadata['currency']}{metadata['unit_price']:.2f}\n"
-                f"Avg Daily: {stats['avg_daily_consumption']:.2f}\nStd Dev: {stats['std_daily']:.2f}\n"
-                f"CV: {stats['cv_percent']:.1f}%\n━━━━━━━━\nTotal Cost: {metadata['currency']}{cost_summary['total_cost']:,.0f}\n"
-                f"Stockout: {cost_summary['stockout_days']}d")
+# -------------------------
+# TAB 1 — EDA
+# -------------------------
+with tab1:
+    st.header("📊 Exploratory Data Analysis")
+    st.write(df.head())
+    st.write("Total records:", len(df))
 
-    ax1.text(0.02, 0.98, info_text, transform=ax1.transAxes, fontsize=8,
-             ha="left", va="top", fontweight="bold", color="#111827",
-             bbox=dict(boxstyle="round,pad=0.6", facecolor="#FEF3C7", alpha=0.95,
-                      edgecolor="#D97706", linewidth=1.5))
+# -------------------------
+# PREPARE SERIES
+# -------------------------
+monthly = get_monthly(df)
+weekly = get_weekly(df)
 
-    ax2.set_facecolor("#FFFFFF")
-    x = np.arange(len(df))
-    width = 0.35
+if not monthly:
+    st.warning("No sufficient monthly data for time series and ABC-XYZ. Check your file.")
+    series_m = None
+    code, desc = "", ""
+else:
+    items_list = [f"{c} - {d}" for (c, d) in monthly.keys()]
+    selected = st.sidebar.selectbox("Select a product", items_list)
+    key = list(monthly.keys())[items_list.index(selected)]
+    code, desc = key
+    series_m = monthly[key]
 
-    ax2.bar(x - width/2, df["Mal Giriş"], width, label="Inflow", color="#16A34A", alpha=0.8)
-    ax2.bar(x + width/2, df["Tüketim Miktarı"], width, label="Consumption", color="#DC2626", alpha=0.8)
-
-    ax2.set_xlabel("Days", fontsize=11, fontweight="bold", color="#374151")
-    ax2.set_ylabel("Quantity", fontsize=11, fontweight="bold", color="#374151")
-    ax2.set_title("Inflow vs Consumption", fontsize=11, fontweight="bold")
-    ax2.legend(fontsize=9)
-    ax2.grid(True, alpha=0.2, linestyle="--", axis="y")
-    ax2.spines[["top", "right"]].set_visible(False)
-
-    if len(df) > 50:
-        step = len(df) // 10
-        ax2.set_xticks(range(0, len(df), step))
-
-    plt.tight_layout()
-    return fig
-
-def create_cost_breakdown_chart(cost_summary: dict, stats: dict, metadata: dict) -> None:
-    """
-    YENİ: Maliyet Dağılımı Grafiği
-    """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    fig.patch.set_facecolor("#F8FAFC")
-
-    # Pie Chart
-    ax1.set_facecolor("#FFFFFF")
-    costs = [
-        cost_summary["total_holding_cost"],
-        cost_summary["total_ordering_cost"],
-        cost_summary["total_stockout_cost"]
-    ]
-    labels = [f"Holding\n{metadata['currency']}{costs[0]:,.0f}", 
-              f"Ordering\n{metadata['currency']}{costs[1]:,.0f}",
-              f"Stockout\n{metadata['currency']}{costs[2]:,.0f}"]
-    colors = ["#16A34A", "#D97706", "#DC2626"]
-
-    wedges, texts, autotexts = ax1.pie(costs, labels=labels, autopct="%1.1f%%", 
-                                        colors=colors, startangle=90, textprops={"fontsize": 10, "weight": "bold"})
-    ax1.set_title("Cost Breakdown", fontsize=12, fontweight="bold")
-
-    # Summary Text
-    ax2.axis("off")
-    summary_text = f"""
-📊 COST ANALYSIS SUMMARY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Total Period: {stats['total_days']} days
-Total Consumption: {stats['total_consumption']:,.0f} units
-Annual Demand: {stats['annual_demand']:,.0f} units
-Avg Daily: {stats['avg_daily_consumption']:.2f} units
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 COSTS (Period):
-Holding: {metadata['currency']}{cost_summary['total_holding_cost']:,.2f}
-Ordering: {metadata['currency']}{cost_summary['total_ordering_cost']:,.2f}
-Stockout: {metadata['currency']}{cost_summary['total_stockout_cost']:,.2f}
-────────────────
-TOTAL: {metadata['currency']}{cost_summary['total_cost']:,.2f}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📈 ANNUALIZED:
-Avg Daily: {metadata['currency']}{cost_summary['avg_daily_cost']:.2f}
-Annual: {metadata['currency']}{cost_summary['annual_cost']:,.2f}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️  STOCKOUT METRICS:
-Total Shortage: {cost_summary['total_stockout_units']:.0f} units
-Stockout Days: {cost_summary['stockout_days']} days
-Orders Placed: {cost_summary['total_orders']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 RECOMMENDATIONS:
-EOQ: {stats['eoq']:.0f} units
-ROP: {stats['rop']:.0f} units
-Avg Inventory: {stats['avg_inventory']:.0f} units
-    """
-
-    ax2.text(0.05, 0.95, summary_text, transform=ax2.transAxes, fontsize=9,
-             ha="left", va="top", family="monospace", fontweight="bold",
-             bbox=dict(boxstyle="round,pad=1", facecolor="#F3F4F6", alpha=0.95,
-                      edgecolor="#6B7280", linewidth=1.5))
-
-    plt.tight_layout()
-    return fig
-
-# =============================================================================
-# 8. STREAMLIT UI
-# =============================================================================
-
-st.set_page_config(page_title="📦 DSS - Integrated Inventory", layout="wide")
-st.title("📦 Integrated Decision Support System - YENİ ENVANTER")
-
-# Sidebar - Input Selection
-st.sidebar.title("⚙️ Configuration")
-input_mode = st.sidebar.radio("Data Source", ["Classic System (Monthly)", "New System (Real Data)"])
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLASSIC SYSTEM - ESKİ UI
-# ─────────────────────────────────────────────────────────────────────────────
-
-if input_mode == "Classic System (Monthly)":
-    st.header("1️⃣ Classical System - Monthly Data")
-    uploaded = st.file_uploader("Upload Excel (xlsx/xls) or CSV", type=["xlsx","xls","csv"])
-
-    if uploaded is None:
-        st.info("Please upload a file to continue.")
-        st.stop()
-
-    df = load_file(uploaded)
-    if df is None or df.empty:
-        st.error("Loaded file is empty or invalid.")
-        st.stop()
-
-    df = clean_raw(df)
-    st.success("Data successfully loaded!")
-
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["📊 EDA", "🧮 ABC–XYZ", "📈 Forecast", "📦 Inventory", "⏳ Time Series", "📋 Summary Dashboard"]
-    )
-
-    # TAB 1 — EDA
-    with tab1:
-        st.header("📊 Exploratory Data Analysis")
-        st.write(df.head())
-        st.write("Total records:", len(df))
-
-    monthly = get_monthly(df)
-    weekly = get_weekly(df)
+# -------------------------
+# TAB 2 — ABC–XYZ
+# -------------------------
+with tab2:
+    st.header("🧮 ABC–XYZ Analysis")
 
     if not monthly:
-        st.warning("No sufficient monthly data. Check your file.")
-        series_m = None
-        code, desc = "", ""
+        st.info("ABC-XYZ analysis is not available because monthly data is insufficient.")
     else:
-        items_list = [f"{c} - {d}" for (c, d) in monthly.keys()]
-        selected = st.sidebar.selectbox("Select a product", items_list)
-        key = list(monthly.keys())[items_list.index(selected)]
-        code, desc = key
-        series_m = monthly[key]
+        df_abc = abc_analysis(monthly)
+        df_xyz = xyz_analysis(monthly)
 
-    # TAB 2 — ABC–XYZ
-    with tab2:
-        st.header("🧮 ABC–XYZ Analysis")
+        st.subheader("ABC Analysis")
+        st.dataframe(df_abc)
 
-        if not monthly:
-            st.info("ABC-XYZ analysis requires sufficient monthly data.")
-        else:
-            df_abc = abc_analysis(monthly)
-            df_xyz = xyz_analysis(monthly)
+        st.subheader("XYZ Analysis")
+        st.dataframe(df_xyz)
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("ABC Analysis")
-                st.dataframe(df_abc, use_container_width=True)
+        st.subheader("ABC-XYZ Matrix")
+        try:
+            merged = df_abc.merge(df_xyz[["Material", "XYZ"]], on="Material", how="left")
+            merged["ABC_XYZ"] = merged["ABC"].fillna("") + merged["XYZ"].fillna("")
 
-            with col2:
-                st.subheader("XYZ Analysis")
-                st.dataframe(df_xyz, use_container_width=True)
+            if isinstance(merged, pd.DataFrame) and not merged.empty:
+                try:
+                    styled = merged.style.map(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
+                except AttributeError:
+                    styled = merged.style.applymap(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
 
-            st.subheader("ABC-XYZ Matrix")
-            try:
-                merged = df_abc.merge(df_xyz[["Material", "XYZ"]], on="Material", how="left")
-                merged["ABC_XYZ"] = merged["ABC"].fillna("") + merged["XYZ"].fillna("")
+                st.markdown(styled.to_html(), unsafe_allow_html=True)
+            else:
+                st.warning("ABC-XYZ matrix could not be created. Check data consistency.")
+        except Exception as e:
+            st.error(f"Error while creating ABC-XYZ matrix: {e}")
 
-                if isinstance(merged, pd.DataFrame) and not merged.empty:
-                    try:
-                        styled = merged.style.map(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
-                    except AttributeError:
-                        styled = merged.style.applymap(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
+# -------------------------
+# TAB 3 — FORECAST
+# -------------------------
+with tab3:
+    st.header("📈 Forecasting Models")
 
-                    st.markdown(styled.to_html(), unsafe_allow_html=True)
-            except Exception as e:
-                st.error(f"Error: {e}")
+    if series_m is None:
+        st.info("Forecasting is not available because no product could be selected.")
+    else:
+        col1, col2, col3 = st.columns(3)
 
-    # TAB 3 — FORECAST
-    with tab3:
-        st.header("📈 Forecasting Models")
-
-        if series_m is None:
-            st.info("No product selected.")
-        else:
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                st.subheader("ARIMA")
-                fc_arima = arima_forecast(series_m)
-                if fc_arima is not None:
-                    st.line_chart(fc_arima)
-                else:
-                    st.warning("ARIMA failed.")
-
-            with col2:
-                st.subheader("XGBoost")
-                y_test_xgb, preds_xgb, mae_xgb, rmse_xgb = ml_forecast(series_m, "xgboost")
-                if preds_xgb is not None:
-                    st.write(f"MAE: {mae_xgb:.2f}, RMSE: {rmse_xgb:.2f}")
-                    st.line_chart(pd.DataFrame({"Actual": y_test_xgb, "Prediction": preds_xgb}))
-                else:
-                    st.warning("Insufficient data.")
-
-            with col3:
-                st.subheader("CatBoost")
-                y_test_cat, preds_cat, mae_cat, rmse_cat = ml_forecast(series_m, "catboost")
-                if preds_cat is not None:
-                    st.write(f"MAE: {mae_cat:.2f}, RMSE: {rmse_cat:.2f}")
-                    st.line_chart(pd.DataFrame({"Actual": y_test_cat, "Prediction": preds_cat}))
-                else:
-                    st.warning("Insufficient data.")
-
-    # TAB 4 — INVENTORY
-    with tab4:
-        st.header("📦 Inventory Optimization")
-
-        if series_m is None:
-            st.info("No product selected.")
-        else:
-            mean_monthly = series_m.mean()
-            std_monthly = series_m.std()
-            mean_daily = mean_monthly / 30 if mean_monthly > 0 else 0.0
-            std_daily = std_monthly / 30 if std_monthly > 0 else 0.0
-
-            col_left, col_right = st.columns([1, 1.4])
-
-            with col_left:
-                st.subheader("Parameters")
-                service = st.slider("Service Level", 0.80, 0.999, SERVICE_LEVEL)
-                lt = st.number_input("Lead Time (days)", 1, 60, DEFAULT_LEAD_TIME_DAYS)
-
-                if mean_daily <= 0:
-                    st.warning("Not enough demand data.")
-                else:
-                    st.metric("Daily Mean", f"{mean_daily:.2f}")
-                    st.metric("Daily Std Dev", f"{std_daily:.2f}")
-
-            with col_right:
-                st.info("Classic inventory visualization")
-
-    # TAB 5 — TIME SERIES
-    with tab5:
-        st.header("⏳ Time Series")
-        if series_m is None:
-            st.info("No product selected.")
-        else:
-            st.line_chart(series_m)
-
-    # TAB 6 — DASHBOARD
-    with tab6:
-        st.header("📋 Summary Dashboard")
-        if series_m is None:
-            st.info("No product selected.")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW SYSTEM - YENİ ENVANTER UI
-# ─────────────────────────────────────────────────────────────────────────────
-
-else:
-    st.header("2️⃣ NEW System - Real Inventory Data (ForecastEOQ Format)")
-    
-    uploaded_excel = st.file_uploader("Upload ForecastEOQ.xlsx", type=["xlsx"])
-    
-    if uploaded_excel is None:
-        st.info("Please upload ForecastEOQ.xlsx file containing material sheets.")
-        st.stop()
-    
-    # Material code input
-    st.sidebar.subheader("📊 Material Selection")
-    material_code = st.sidebar.number_input("Enter Material Code", value=600080, step=1)
-    
-    # Load data
-    df_new, metadata = load_material_data_from_excel(uploaded_excel, material_code)
-    
-    if df_new is None or metadata is None:
-        st.error(f"Could not load material {material_code}. Check Excel sheet name.")
-        st.stop()
-    
-    # Calculate real inventory
-    df_new = calculate_real_inventory(df_new)
-    
-    # Calculate statistics
-    stats = calculate_statistics(df_new, metadata)
-    
-    # Calculate costs
-    df_new, cost_summary = calculate_real_inventory_costs(df_new, metadata)
-    
-    st.success(f"✅ Material {material_code} loaded successfully!")
-    
-    # Create tabs
-    tab_inv, tab_cost, tab_data, tab_metrics = st.tabs(
-        ["📦 Inventory Graph", "💰 Cost Analysis", "📋 Data Table", "📊 Metrics"]
-    )
-    
-    # TAB 1: Inventory Graph
-    with tab_inv:
-        st.header(f"📦 Inventory Level - Material {material_code}")
-        
-        fig = create_eoq_graph(df_new, stats, cost_summary, metadata)
-        st.pyplot(fig)
-        plt.close()
-    
-    # TAB 2: Cost Analysis
-    with tab_cost:
-        st.header(f"💰 Cost Analysis - Material {material_code}")
-        
-        fig = create_cost_breakdown_chart(cost_summary, stats, metadata)
-        st.pyplot(fig)
-        plt.close()
-    
-    # TAB 3: Data Table
-    with tab_data:
-        st.header("📋 Detailed Data")
-        
-        # Filter by date range
-        col1, col2 = st.columns(2)
         with col1:
-            start_date = st.date_input("Start Date", df_new["Tarih"].min().date())
-        with col2:
-            end_date = st.date_input("End Date", df_new["Tarih"].max().date())
-        
-        df_filtered = df_new[(df_new["Tarih"].dt.date >= start_date) & (df_new["Tarih"].dt.date <= end_date)]
-        
-        st.dataframe(df_filtered[[
-            "Tarih", "Mal Giriş", "Tüketim Miktarı", "Envanter", "Stockout",
-            "Holding_Cost_Daily", "Ordering_Cost_Daily", "Stockout_Cost_Daily", "Total_Cost_Daily"
-        ]].round(2), use_container_width=True)
-    
-    # TAB 4: Metrics
-    with tab_metrics:
-        st.header("📊 Key Metrics & Recommendations")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("EOQ (Optimal Order)", f"{stats['eoq']:.0f} units")
-        col2.metric("ROP (Reorder Point)", f"{stats['rop']:.0f} units")
-        col3.metric("Avg Inventory", f"{stats['avg_inventory']:.0f} units")
-        col4.metric("Lead Time", f"{metadata['lead_time']} days")
-        
-        st.markdown("---")
-        
-        col5, col6, col7 = st.columns(3)
-        col5.metric("Avg Daily Consumption", f"{stats['avg_daily_consumption']:.2f} units")
-        col6.metric("Std Dev", f"{stats['std_daily']:.2f} units")
-        col7.metric("CV", f"{stats['cv_percent']:.1f}%")
-        
-        st.markdown("---")
-        
-        col8, col9, col10, col11 = st.columns(4)
-        col8.metric("Total Orders", f"{cost_summary['total_orders']}")
-        col9.metric("Stockout Days", f"{cost_summary['stockout_days']}")
-        col10.metric("Total Shortage", f"{cost_summary['total_stockout_units']:.0f} units")
-        col11.metric("Service Level", f"{SERVICE_LEVEL*100:.0f}%")
-        
-        st.markdown("---")
-        
-        col12, col13, col14 = st.columns(3)
-        col12.metric("Total Holding Cost", f"{metadata['currency']}{cost_summary['total_holding_cost']:,.2f}")
-        col13.metric("Total Ordering Cost", f"{metadata['currency']}{cost_summary['total_ordering_cost']:,.2f}")
-        col14.metric("Total Stockout Cost", f"{metadata['currency']}{cost_summary['total_stockout_cost']:,.2f}")
-        
-        st.markdown("---")
-        col15, col16 = st.columns(2)
-        col15.metric("Total Cost (Period)", f"{metadata['currency']}{cost_summary['total_cost']:,.2f}")
-        col16.metric("Annualized Cost", f"{metadata['currency']}{cost_summary['annual_cost']:,.2f}")
+            st.subheader("ARIMA")
+            fc_arima = arima_forecast(series_m)
+            if fc_arima is not None:
+                st.line_chart(fc_arima)
+            else:
+                st.warning("ARIMA forecast could not be generated.")
 
-st.sidebar.markdown("---")
-st.sidebar.info(
-    "🔄 **Integrated System**\n\n"
-    "- **Classic**: Aylık veriler, ABC-XYZ, Forecast\n"
-    "- **New**: Gerçek envanter, Maliyet analizi, Stok azlığı\n\n"
-    "🎯 Service Level: 95%\n"
-    "📊 Lead Time: 7 günü varsayılan"
-)
+        with col2:
+            st.subheader("XGBoost")
+            y_test_xgb, preds_xgb, mae_xgb, rmse_xgb = ml_forecast(series_m, "xgboost")
+            if preds_xgb is not None:
+                st.write(f"MAE: {mae_xgb:.2f}, RMSE: {rmse_xgb:.2f}")
+                st.line_chart(pd.DataFrame({"Actual": y_test_xgb, "Prediction": preds_xgb}))
+            else:
+                st.warning("Insufficient data for XGBoost.")
+
+        with col3:
+            st.subheader("CatBoost")
+            y_test_cat, preds_cat, mae_cat, rmse_cat = ml_forecast(series_m, "catboost")
+            if preds_cat is not None:
+                st.write(f"MAE: {mae_cat:.2f}, RMSE: {rmse_cat:.2f}")
+                st.line_chart(pd.DataFrame({"Actual": y_test_cat, "Prediction": preds_cat}))
+            else:
+                st.warning("Insufficient data for CatBoost.")
+
+# -------------------------
+# TAB 4 — INVENTORY (YENİ + ESKİ HYBRID)
+# -------------------------
+with tab4:
+    st.header("📦 Inventory Optimization — Simulation Based")
+
+    if series_m is None:
+        st.info("Inventory optimization is not available because no product could be selected.")
+    else:
+        # ESKİ SYSTEM CALCULATIONS
+        mean_monthly = series_m.mean()
+        std_monthly = series_m.std()
+        mean_daily = mean_monthly / 30 if mean_monthly > 0 else 0.0
+        std_daily = std_monthly / 30 if std_monthly > 0 else 0.0
+
+        col_left, col_right = st.columns([1, 1.4])
+
+        with col_left:
+            st.subheader("Parameters")
+
+            service = st.slider("Service Level", 0.80, 0.999, SERVICE_LEVEL)
+            lt = st.number_input("Lead Time (days)", 1, 60, DEFAULT_LEAD_TIME_DAYS)
+            order_cost = st.number_input("Order Cost", 1.0, 10000.0, ORDERING_COST)
+            hold_pct = st.number_input("Holding Cost Rate", 0.01, 1.0, HOLDING_COST_PCT)
+            unit_cost = st.number_input("Unit Cost", 0.1, 1000.0, UNIT_COST)
+            stockout_cost = st.number_input("Stockout Cost per Unit", 1.0, 5000.0, STOCKOUT_COST_PER_UNIT)
+
+            if mean_daily <= 0:
+                st.warning("Not enough demand data to compute inventory metrics.")
+                result = None
+                history = None
+            else:
+                item = MaterialItem(
+                    code=str(code),
+                    name=str(desc),
+                    mean_daily=mean_daily,
+                    std_daily=std_daily,
+                    distribution="gamma",
+                    lead_time_days=int(lt),
+                )
+
+                rop = calculate_reorder_point(item.mean_daily, item.std_daily,
+                                              item.lead_time_days, service, item.distribution)
+                eoq = calculate_eoq(item.mean_daily, order_cost, hold_pct, unit_cost)
+
+                st.subheader("Key Inventory Metrics")
+                st.metric("Reorder Point (ROP)", f"{rop:.1f}")
+                st.metric("EOQ", f"{eoq:.1f}")
+                st.metric("Daily Mean Demand", f"{item.mean_daily:.2f}")
+                st.metric("Daily Std Dev", f"{item.std_daily:.2f}")
+
+                st.markdown("---")
+                st.subheader("Simulation Results")
+
+                result, history = simulate_inventory_with_real_data(item, rop, eoq)
+
+                colm1, colm2 = st.columns(2)
+                colm1.metric("Avg Inventory (>=0)", f"{result['avg_inventory']:.1f}")
+                colm2.metric("Min Inventory", f"{result['min_inventory']:.1f}")
+                colm3, colm4 = st.columns(2)
+                colm3.metric("Max Inventory", f"{result['max_inventory']:.1f}")
+                colm4.metric("Fill Rate", f"{result['fill_rate']:.1f}%")
+                colm5, colm6 = st.columns(2)
+                colm5.metric("Stockout Days", f"{result['stockout_days']}")
+                colm6.metric("Total Shortage", f"{result['total_shortage']:.1f}")
+
+        with col_right:
+            if series_m is None or mean_daily <= 0 or result is None or history is None:
+                st.info("Inventory plots will appear here once demand statistics and simulation are available.")
+            else:
+                st.subheader("Inventory & Demand Over Time")
+
+                days = history["days"]
+                inventory = history["inventory"]
+                demand = history["demand"]
+
+                fig1, ax1 = plt.subplots(figsize=(8, 4))
+                ax1.plot(days, inventory, label="Inventory Level", color="#DC2626", linewidth=1.8)
+                ax1.axhline(0, color="black", linewidth=1, linestyle="--", alpha=0.5)
+                ax1.axhline(result["reorder_point"], color="#16A34A", linestyle="--",
+                            linewidth=1.5, label="ROP")
+                ax1.set_xlabel("Day")
+                ax1.set_ylabel("Inventory")
+                ax1.set_title(f"Inventory Trajectory - {code}")
+                ax1.legend()
+                ax1.grid(alpha=0.3)
+                st.pyplot(fig1)
+                plt.close(fig1)
+
+                fig2, ax2 = plt.subplots(figsize=(8, 3))
+                ax2.plot(days, demand, color="#2563EB", linewidth=1.5)
+                ax2.set_xlabel("Day")
+                ax2.set_ylabel("Demand")
+                ax2.set_title("Daily Demand (Simulated)")
+                ax2.grid(alpha=0.3)
+                st.pyplot(fig2)
+                plt.close(fig2)
+
+                fig3, ax3 = plt.subplots(figsize=(8, 3))
+                ax3.hist(demand, bins=30, color="#0EA5E9", alpha=0.8, edgecolor="white")
+                ax3.set_xlabel("Demand")
+                ax3.set_ylabel("Frequency")
+                ax3.set_title("Demand Distribution (Simulated)")
+                st.pyplot(fig3)
+                plt.close(fig3)
+
+        # YENİ SYSTEM - REAL DATA ANALYSIS
+        st.markdown("---")
+        st.subheader("📊 Real Data Analysis (ForecastEOQ Format)")
+
+        col_real1, col_real2 = st.columns([1, 2])
+
+        with col_real1:
+            st.write("**Load Real Inventory Data:**")
+            uploaded_real = st.file_uploader("Upload ForecastEOQ.xlsx", type=["xlsx"], key="real_data")
+            
+            if uploaded_real is not None:
+                material_code_input = st.number_input("Material Code", value=600080, step=1)
+                
+                df_real, metadata_real = load_material_data_real(uploaded_real, material_code_input)
+                
+                if df_real is not None:
+                    df_real = calculate_real_inventory(df_real)
+                    df_real, cost_summary = calculate_real_inventory_costs(df_real, metadata_real)
+                    stats_real = calculate_statistics_real(df_real, metadata_real)
+                    
+                    st.success("✅ Real data loaded!")
+                    st.metric("EOQ (Real)", f"{stats_real['eoq']:.0f}")
+                    st.metric("ROP (Real)", f"{stats_real['rop']:.0f}")
+                    st.metric("Avg Inventory (Real)", f"{stats_real['avg_inventory']:.0f}")
+                    
+        with col_real2:
+            if uploaded_real is not None and df_real is not None:
+                st.write("**Cost Summary (Real Data):**")
+                
+                col_c1, col_c2, col_c3 = st.columns(3)
+                col_c1.metric("Holding Cost", f"{metadata_real['currency']}{cost_summary['total_holding_cost']:,.0f}")
+                col_c2.metric("Ordering Cost", f"{metadata_real['currency']}{cost_summary['total_ordering_cost']:,.0f}")
+                col_c3.metric("Stockout Cost", f"{metadata_real['currency']}{cost_summary['total_stockout_cost']:,.0f}")
+                
+                col_c4, col_c5 = st.columns(2)
+                col_c4.metric("Total Cost", f"{metadata_real['currency']}{cost_summary['total_cost']:,.0f}")
+                col_c5.metric("Annual Cost", f"{metadata_real['currency']}{cost_summary['annual_cost']:,.0f}")
+                
+                st.metric("Stockout Days", f"{cost_summary['stockout_days']}")
+                st.metric("Total Shortage", f"{cost_summary['total_stockout_units']:.0f} units")
+                
+                # Real data graph
+                st.subheader("Real Inventory Level")
+                fig_real, ax_real = plt.subplots(figsize=(12, 5))
+                ax_real.plot(df_real["Tarih"], df_real["Envanter"], color="#DC2626", linewidth=2, label="Inventory")
+                ax_real.axhline(0, color="black", linestyle="--", alpha=0.5)
+                ax_real.axhline(stats_real["rop"], color="#16A34A", linestyle="--", linewidth=2, label=f"ROP={stats_real['rop']:.0f}")
+                ax_real.fill_between(df_real["Tarih"], 0, df_real["Envanter"], 
+                                     where=(df_real["Envanter"] < 0), alpha=0.2, color="#EF4444", label="Stockout")
+                ax_real.set_xlabel("Date")
+                ax_real.set_ylabel("Inventory (units)")
+                ax_real.set_title(f"Real Inventory Level - Material {material_code_input}")
+                ax_real.legend()
+                ax_real.grid(alpha=0.3)
+                st.pyplot(fig_real)
+                plt.close(fig_real)
+            else:
+                st.info("Upload ForecastEOQ.xlsx to see real inventory analysis")
+
+# -------------------------
+# TAB 5 — TIME SERIES
+# -------------------------
+with tab5:
+    st.header("⏳ Time Series")
+    if series_m is None:
+        st.info("Time series is not available because no product could be selected.")
+    else:
+        st.line_chart(series_m)
+
+# -------------------------
+# TAB 6 — DASHBOARD
+# -------------------------
+with tab6:
+    st.header("📋 Summary Dashboard")
+
+    if series_m is None:
+        st.info("Dashboard is not available because no product could be selected.")
+    else:
+        st.subheader("Product Information")
+        st.write(f"**Code:** {code}")
+        st.write(f"**Description:** {desc}")
+
+        st.subheader("Monthly Demand")
+        st.line_chart(series_m)
+
+        st.subheader("Forecast Results")
+        if "fc_arima" in locals() and fc_arima is not None:
+            st.write("ARIMA Forecast")
+            st.line_chart(fc_arima)
+
+        if "preds_xgb" in locals() and preds_xgb is not None:
+            st.write("XGBoost Forecast")
+            st.line_chart(pd.DataFrame({"Actual": y_test_xgb, "Prediction": preds_xgb}))
+
+        if "preds_cat" in locals() and preds_cat is not None:
+            st.write("CatBoost Forecast")
+            st.line_chart(pd.DataFrame({"Actual": y_test_cat, "Prediction": preds_cat}))
+
+        mean_monthly = series_m.mean()
+        std_monthly = series_m.std()
+        mean_daily = mean_monthly / 30 if mean_monthly > 0 else 0.0
+        std_daily = std_monthly / 30 if std_monthly > 0 else 0.0
+
+        st.subheader("Inventory Metrics Snapshot")
+        st.metric("Daily Mean Demand", f"{mean_daily:.2f}")
+        st.metric("Daily Std Dev", f"{std_daily:.2f}")
+        st.metric("Default Service Level", f"{SERVICE_LEVEL*100:.0f}%")
