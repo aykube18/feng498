@@ -492,7 +492,7 @@ with tab4:
     if series_m is None:
         st.info("Inventory optimization is not available because no product could be selected.")
     else:
-       import numpy as np
+        import numpy as np
         import pandas as pd
         import matplotlib
         matplotlib.use("Agg")
