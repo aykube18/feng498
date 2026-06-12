@@ -1,514 +1,1047 @@
 import streamlit as st
 import pandas as pd
-import io
-from pathlib import Path
+import numpy as np
+import warnings
+warnings.filterwarnings("ignore")
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Decision Support System",
-    page_icon="assets/icon.png" if Path("assets/icon.png").exists() else ":bar_chart:",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+from statsmodels.tsa.arima.model import ARIMA
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from xgboost import XGBRegressor
+from catboost import CatBoostRegressor
+from scipy.stats import norm
+from dataclasses import dataclass
+import math
+import matplotlib.pyplot as plt
 
-# ── Custom CSS ─────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    /* Sidebar */
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
+# =============================================================================
+# 1. DATA LOADING
+# ============================================================================
+
+def load_file(uploaded_file):
+    if uploaded_file is None:
+        return None
+    if uploaded_file.name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+    else:
+        return pd.read_excel(uploaded_file)
+
+def clean_raw(df):
+    rename_map = {
+        "Malzeme": "Material",
+        "Malzeme kısa metni": "Description",
+        "Hareket türleri metni": "MovementType",
+        "Kayıt tarihi": "Date",
+        "Miktar Abs": "Quantity",
+        "Temel ölçü birimi": "Unit",
+        "WhichDepo?": "Warehouse"
     }
-    [data-testid="stSidebar"] * { color: #e2e8f0 !important; }
-    [data-testid="stSidebar"] .stRadio label { font-size: 0.95rem; }
+    df = df.rename(columns=rename_map)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
+    df["Material"] = df["Material"].astype(str)
+    df = df.dropna(subset=["Date"])
+    return df
 
-    /* Main area */
-    .main .block-container { padding-top: 1.5rem; }
+# =============================================================================
+# 2. AGGREGATION FUNCTIONS
+# =============================================================================
 
-    /* Section headers */
-    .module-header {
-        font-size: 1.6rem;
-        font-weight: 700;
-        color: #1e293b;
-        border-left: 5px solid #3b82f6;
-        padding-left: 12px;
-        margin-bottom: 1rem;
-    }
+def get_monthly(df):
+    result = {}
+    if df.empty:
+        return result
+    for (code, desc), grp in df.groupby(["Material", "Description"]):
+        m = grp.set_index("Date")["Quantity"].resample("MS").sum()
+        if len(m) < 6:
+            continue
+        full = pd.date_range(start=m.index.min(), end=m.index.max(), freq="MS")
+        m = m.reindex(full, fill_value=0)
+        result[(code, desc)] = m
+    return result
 
-    /* Upload area */
-    .upload-box {
-        border: 2px dashed #94a3b8;
-        border-radius: 10px;
-        padding: 20px;
-        text-align: center;
-        background: #f8fafc;
-    }
+def get_weekly(df):
+    result = {}
+    if df.empty:
+        return result
+    for (code, desc), grp in df.groupby(["Material", "Description"]):
+        w = grp.set_index("Date")["Quantity"].resample("W").sum()
+        if len(w) < 20:
+            continue
+        full = pd.date_range(start=w.index.min(), end=w.index.max(), freq="W")
+        w = w.reindex(full, fill_value=0)
+        result[(code, desc)] = w
+    return result
 
-    /* Status badges */
-    .badge-ok   { background:#dcfce7; color:#166534; border-radius:6px; padding:2px 10px; font-size:0.8rem; }
-    .badge-warn { background:#fef9c3; color:#854d0e; border-radius:6px; padding:2px 10px; font-size:0.8rem; }
-    .badge-err  { background:#fee2e2; color:#991b1b; border-radius:6px; padding:2px 10px; font-size:0.8rem; }
+# =============================================================================
+# 3. FORECAST MODELS
+# =============================================================================
 
-    /* Metric cards */
-    div[data-testid="metric-container"] {
-        background: #f1f5f9;
-        border: 1px solid #e2e8f0;
-        border-radius: 10px;
-        padding: 12px;
-    }
-
-    /* Tab styling */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 4px;
-        background: #f1f5f9;
-        border-radius: 10px;
-        padding: 4px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 8px;
-        padding: 6px 18px;
-    }
-    .stTabs [aria-selected="true"] {
-        background: #3b82f6 !important;
-        color: white !important;
-    }
-
-    /* Info callout */
-    .info-callout {
-        background: #eff6ff;
-        border-left: 4px solid #3b82f6;
-        border-radius: 0 8px 8px 0;
-        padding: 12px 16px;
-        font-size: 0.9rem;
-        color: #1e40af;
-        margin-bottom: 1rem;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-
-# ── Session state initialisation ───────────────────────────────────────────────
-DEFAULTS = {
-    "uploaded_files":       {},   # {filename: bytes}
-    "dataframes":           {},   # {filename: pd.DataFrame}
-    "forecast_output":      None, # forecast result DataFrame → feeds Inventory
-    "forecast_done":        False,
-    "abc_xyz_data":         None,
-    "active_module":        "Dashboard",
-}
-for k, v in DEFAULTS.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-
-# ── File routing rules ─────────────────────────────────────────────────────────
-FILE_ROUTES = {
-    "motorin tüketim":  "forecast",
-    "forecasteoq":      "inventory",
-    # ABC-XYZ: any other xlsx/xls not matched above
-}
-
-def route_file(filename: str) -> str:
-    """Determine which module a file belongs to by name pattern."""
-    name_lower = filename.lower().replace(" ", " ")
-    for pattern, module in FILE_ROUTES.items():
-        if pattern in name_lower:
-            return module
-    return "abc_xyz"   # default for unrecognised files
-
-
-def load_dataframe(filename: str, raw_bytes: bytes) -> pd.DataFrame | None:
-    """Load Excel/CSV bytes into a DataFrame safely."""
+def arima_forecast(series, horizon=6):
+    if series is None or len(series) < 6:
+        return None
     try:
-        ext = Path(filename).suffix.lower()
-        if ext in (".xlsx", ".xls"):
-            return pd.read_excel(io.BytesIO(raw_bytes))
-        elif ext == ".csv":
-            return pd.read_csv(io.BytesIO(raw_bytes))
-        else:
-            return None          # docx → no DataFrame needed here
-    except Exception as e:
-        st.error(f"Could not parse **{filename}**: {e}")
+        model = ARIMA(series, order=(1,1,1))
+        res = model.fit()
+        fc = res.forecast(steps=horizon)
+        return fc
+    except Exception:
         return None
 
+def make_features(series, lags=12):
+    df = pd.DataFrame({"y": series})
+    for lag in range(1, lags+1):
+        df[f"lag_{lag}"] = df["y"].shift(lag)
+    df["month"] = series.index.month
+    df["trend"] = np.arange(len(series))
+    return df.dropna()
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## Decision Support System")
-    st.markdown("---")
+def ml_forecast(series, model_type="xgboost"):
+    if series is None or len(series) < 20:
+        return None, None, None, None
 
-    # ── File uploader ──────────────────────────────────────────────────────────
-    st.markdown("### Upload Data Files")
-    uploaded = st.file_uploader(
-        label="Upload files (xlsx, xls, docx)",
-        type=["xlsx", "xls", "docx", "csv"],
-        accept_multiple_files=True,
-        key="file_uploader",
-        help="Upload all your data files here. They will be routed to the correct module automatically.",
-    )
+    df = make_features(series)
+    if len(df) < 20:
+        return None, None, None, None
 
-    if uploaded:
-        for f in uploaded:
-            if f.name not in st.session_state["uploaded_files"]:
-                raw = f.read()
-                st.session_state["uploaded_files"][f.name] = raw
-                df = load_dataframe(f.name, raw)
-                if df is not None:
-                    st.session_state["dataframes"][f.name] = df
-                    module_tag = route_file(f.name)
-                    st.success(f"{f.name} → **{module_tag}**")
+    X = df.drop("y", axis=1)
+    y = df["y"]
 
-    # ── Uploaded files list ────────────────────────────────────────────────────
-    if st.session_state["uploaded_files"]:
-        st.markdown("**Loaded files:**")
-        for fname in st.session_state["uploaded_files"]:
-            tag = route_file(fname)
-            color = {"forecast": "#3b82f6", "inventory": "#10b981",
-                     "abc_xyz": "#f59e0b"}.get(tag, "#94a3b8")
-            st.markdown(
-                f"<small><span style='color:{color}'>&#9679;</span> {fname}</small>",
-                unsafe_allow_html=True,
-            )
-        if st.button("Clear all files", type="secondary", use_container_width=True):
-            for k in ["uploaded_files", "dataframes", "forecast_output",
-                      "forecast_done", "abc_xyz_data"]:
-                st.session_state[k] = DEFAULTS[k]
-            st.rerun()
+    split = int(len(df)*0.8)
+    if split == 0 or split >= len(df):
+        return None, None, None, None
 
-    st.markdown("---")
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
 
-    # ── Navigation ─────────────────────────────────────────────────────────────
-    st.markdown("### Navigation")
-    pages = [
-        "Dashboard",
-        "EDA",
-        "ABC-XYZ Analysis",
-        "Forecast",
-        "Inventory (EOQ)",
-        "Time Series Analysis",
+    if model_type == "xgboost":
+        model = XGBRegressor(
+            n_estimators=300, learning_rate=0.05, max_depth=4,
+            subsample=0.8, colsample_bytree=0.8, random_state=42
+        )
+    else:
+        model = CatBoostRegressor(
+            iterations=300, learning_rate=0.05, depth=4,
+            random_seed=42, verbose=0
+        )
+
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+
+    mae = mean_absolute_error(y_test, preds)
+    rmse = np.sqrt(mean_squared_error(y_test, preds))
+
+    return y_test, preds, mae, rmse
+
+# =============================================================================
+# 4. ABC – XYZ ANALYSIS
+# =============================================================================
+
+def abc_analysis(monthly_dict):
+    records = []
+    for (code, desc), series in monthly_dict.items():
+        total = series.sum()
+        records.append([code, desc, total])
+
+    if not records:
+        return pd.DataFrame(columns=["Material", "Description", "TotalDemand", "Cumulative", "CumulativeRatio", "ABC"])
+
+    df = pd.DataFrame(records, columns=["Material", "Description", "TotalDemand"])
+    df = df.sort_values("TotalDemand", ascending=False)
+    df["Cumulative"] = df["TotalDemand"].cumsum()
+    total_sum = df["TotalDemand"].sum()
+    if total_sum == 0:
+        df["CumulativeRatio"] = 0
+    else:
+        df["CumulativeRatio"] = df["Cumulative"] / total_sum
+
+    def abc_class(x):
+        if x <= 0.80:
+            return "A"
+        elif x <= 0.95:
+            return "B"
+        else:
+            return "C"
+
+    df["ABC"] = df["CumulativeRatio"].apply(abc_class)
+    return df
+
+def xyz_analysis(monthly_dict):
+    records = []
+    for (code, desc), series in monthly_dict.items():
+        mean = series.mean()
+        std = series.std()
+        cv = std / mean if mean > 0 else 999
+
+        if cv < 0.5:
+            xyz = "X"
+        elif cv < 1.0:
+            xyz = "Y"
+        else:
+            xyz = "Z"
+
+        records.append([code, desc, mean, std, cv, xyz])
+
+    if not records:
+        return pd.DataFrame(columns=["Material", "Description", "Mean", "Std", "CV", "XYZ"])
+
+    df = pd.DataFrame(records, columns=["Material", "Description", "Mean", "Std", "CV", "XYZ"])
+    return df
+
+# =============================================================================
+# 5. INVENTORY LOGIC (SIMULATION-BASED)
+# =============================================================================
+
+SERVICE_LEVEL = 0.95
+ORDERING_COST = 2000.0
+HOLDING_COST_PCT = 0.25
+UNIT_COST = 1.0
+SIMULATION_DAYS = 365
+DEFAULT_LEAD_TIME_DAYS = 7
+
+@dataclass
+class MaterialItem:
+    code: str
+    name: str
+    mean_daily: float
+    std_daily: float
+    distribution: str = "gamma"
+    lead_time_days: int = DEFAULT_LEAD_TIME_DAYS
+
+def calculate_reorder_point(mean_daily: float, std_daily: float,
+                            lead_time_days: int,
+                            service_level: float,
+                            distribution: str = "normal") -> float:
+    if mean_daily <= 0:
+        return 0.0
+    lt_mean = mean_daily * lead_time_days
+    lt_std = std_daily * math.sqrt(lead_time_days)
+    try:
+        z = norm.ppf(service_level)
+        return max(0.0, lt_mean + z * lt_std)
+    except Exception:
+        return max(0.0, lt_mean)
+
+def calculate_eoq(mean_daily: float,
+                  ordering_cost: float = ORDERING_COST,
+                  holding_cost_pct: float = HOLDING_COST_PCT,
+                  unit_cost: float = UNIT_COST) -> float:
+    if mean_daily <= 0:
+        return 1.0
+    annual_demand = mean_daily * 365
+    holding_cost = holding_cost_pct * unit_cost
+    if holding_cost <= 0 or annual_demand <= 0:
+        return max(mean_daily * 30, 1)
+    try:
+        eoq = math.sqrt((2 * annual_demand * ordering_cost) / holding_cost)
+        return max(1.0, eoq)
+    except Exception:
+        return max(mean_daily * 30, 1)
+
+def _generate_daily_demand(mean_daily: float, std_daily: float,
+                           distribution: str, day: int) -> float:
+    day_factor = 0.8 if day % 7 in [5, 6] else 1.0
+    spike = np.random.gamma(2, 10) if np.random.random() < 0.05 else 0.0
+
+    if distribution == "normal":
+        base = max(0.0, np.random.normal(mean_daily, std_daily))
+    elif distribution == "gamma":
+        if std_daily <= 0 or mean_daily <= 0:
+            base = mean_daily
+        else:
+            shape = (mean_daily ** 2) / (std_daily ** 2)
+            scale = (std_daily ** 2) / mean_daily
+            base = np.random.gamma(shape=shape, scale=scale)
+    elif distribution == "lognormal":
+        if std_daily <= 0 or mean_daily <= 0:
+            base = mean_daily
+        else:
+            sigma = np.sqrt(np.log((std_daily ** 2 / mean_daily ** 2) + 1))
+            mu = np.log(mean_daily) - (sigma ** 2) / 2
+            base = np.random.lognormal(mean=mu, sigma=sigma)
+    else:
+        base = mean_daily
+
+    return max(0.0, base * day_factor + spike)
+
+def simulate_inventory_with_real_data(item: MaterialItem,
+                                      reorder_point: float,
+                                      order_qty: float,
+                                      simulation_days: int = SIMULATION_DAYS):
+    daily_demands = [
+        _generate_daily_demand(item.mean_daily, item.std_daily, item.distribution, day)
+        for day in range(simulation_days)
     ]
-    icons = {
-        "Dashboard":            "[ DSH ]",
-        "EDA":                  "[ EDA ]",
-        "ABC-XYZ Analysis":     "[ ABC ]",
-        "Forecast":             "[ FOR ]",
-        "Inventory (EOQ)":      "[ INV ]",
-        "Time Series Analysis": "[ TSA ]",
+
+    inventory_history = []
+    demand_history = []
+    order_history = []
+    pending_orders = []
+
+    current_inventory = order_qty
+    total_demand = 0.0
+    total_shortage = 0.0
+    total_fulfilled = 0.0
+    stockout_days = 0
+
+    for day in range(simulation_days):
+        received = 0
+        still_pending = []
+        for arrival_day, qty in pending_orders:
+            if day >= arrival_day:
+                received += qty
+            else:
+                still_pending.append((arrival_day, qty))
+        pending_orders = still_pending
+        current_inventory += received
+
+        demand = daily_demands[day]
+        total_demand += demand
+        demand_history.append(demand)
+
+        if current_inventory >= demand:
+            fulfilled = demand
+            current_inventory -= fulfilled
+            total_fulfilled += fulfilled
+        else:
+            fulfilled = current_inventory
+            shortage = demand - fulfilled
+            current_inventory = -shortage
+            total_shortage += shortage
+            stockout_days += 1
+            total_fulfilled += fulfilled
+
+        if current_inventory <= reorder_point and len(pending_orders) == 0:
+            arrival_day = day + item.lead_time_days
+            pending_orders.append((arrival_day, order_qty))
+            order_history.append((day, order_qty))
+
+        inventory_history.append(current_inventory)
+
+    inv_arr = np.array(inventory_history, dtype=float)
+    fill_rate = (total_fulfilled / total_demand * 100) if total_demand > 0 else 0.0
+
+    result = {
+        "avg_inventory": float(inv_arr[inv_arr >= 0].mean()) if np.any(inv_arr >= 0) else 0.0,
+        "min_inventory": float(inv_arr.min()) if len(inv_arr) > 0 else 0.0,
+        "max_inventory": float(inv_arr.max()) if len(inv_arr) > 0 else 0.0,
+        "total_demand": total_demand,
+        "total_shortage": total_shortage,
+        "stockout_days": stockout_days,
+        "fill_rate": fill_rate,
+        "reorder_point": reorder_point,
+        "order_quantity": order_qty,
     }
 
-    selected = st.radio(
-        "Go to",
-        pages,
-        index=pages.index(st.session_state["active_module"])
-              if st.session_state["active_module"] in pages else 0,
-        format_func=lambda x: f"{icons[x]}  {x}",
-        label_visibility="collapsed",
-    )
-    st.session_state["active_module"] = selected
+    history = {
+        "days": list(range(simulation_days)),
+        "inventory": inventory_history,
+        "demand": demand_history,
+        "orders": order_history,
+    }
 
-    # Forecast → Inventory handoff indicator
-    if st.session_state["forecast_done"]:
-        st.markdown(
-            '<div class="info-callout">Forecast output is ready and will be used in <b>Inventory (EOQ)</b>.</div>',
-            unsafe_allow_html=True,
-        )
+    return result, history
 
-    st.markdown("---")
-    st.caption("v1.0 | Decision Support System")
+# =============================================================================
+# 6. COLOR FUNCTION FOR ABC–XYZ MATRIX
+# =============================================================================
 
+def color_abc_xyz(val):
+    abc_colors = {"A": "#4CAF50", "B": "#FFC107", "C": "#F44336"}
+    xyz_colors = {"X": "#4CAF50", "Y": "#FFC107", "Z": "#F44336"}
+    if val in abc_colors:
+        return f"background-color: {abc_colors[val]}; color: white; font-weight: bold;"
+    if val in xyz_colors:
+        return f"background-color: {xyz_colors[val]}; color: white; font-weight: bold;"
+    return ""
 
-# ── Helper: get the right DataFrame for a module ──────────────────────────────
-def get_df_for_module(module_tag: str) -> pd.DataFrame | None:
-    """Return the first DataFrame whose filename routes to this module."""
-    for fname, df in st.session_state["dataframes"].items():
-        if route_file(fname) == module_tag:
-            return df, fname
-    return None, None
+# =============================================================================
+# 7. STREAMLIT UI
+# =============================================================================
 
+st.set_page_config(page_title="DSS", layout="wide")
+st.title("📦 Integrated Decision Support System")
 
-# ── Module: Dashboard ─────────────────────────────────────────────────────────
-def render_dashboard():
-    st.markdown('<div class="module-header">Summary Dashboard</div>', unsafe_allow_html=True)
+st.header("1️⃣ Data Upload")
+uploaded = st.file_uploader("Upload Excel (xlsx/xls) or CSV", type=["xlsx","xls","csv"])
 
-    files_loaded   = len(st.session_state["uploaded_files"])
-    forecast_ready = st.session_state["forecast_done"]
-    dfs_loaded     = len(st.session_state["dataframes"])
+if uploaded is None:
+    st.info("Please upload a file to continue.")
+    st.stop()
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Files Uploaded",   files_loaded)
-    c2.metric("DataFrames Parsed", dfs_loaded)
-    c3.metric("Forecast Ready",   "Yes" if forecast_ready else "No")
-    c4.metric("Modules",          6)
+df = load_file(uploaded)
+if df is None or df.empty:
+    st.error("Loaded file is empty or invalid.")
+    st.stop()
 
-    st.markdown("---")
-    st.markdown("#### File Routing Map")
+df = clean_raw(df)
+st.success("Data successfully loaded!")
 
-    if not st.session_state["uploaded_files"]:
-        st.info("No files uploaded yet. Use the sidebar to upload your data files.")
-        st.markdown("""
-        **Expected files:**
-        | File | Module |
-        |---|---|
-        | `motorin tüketim.xlsx` | Forecast |
-        | `ForecastEOQ.xlsx` | Inventory (EOQ) |
-        | Any other xlsx / xls | ABC-XYZ Analysis |
-        | Any .docx | Reference / EDA |
-        """)
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["📊 EDA", "🧮 ABC–XYZ", "📈 Forecast", "📦 Inventory", "⏳ Time Series", "📋 Summary Dashboard"]
+)
+
+# -------------------------
+# TAB 1 — EDA
+# -------------------------
+with tab1:
+    st.header("📊 Exploratory Data Analysis")
+    st.write(df.head())
+    st.write("Total records:", len(df))
+
+# -------------------------
+# PREPARE SERIES
+# -------------------------
+monthly = get_monthly(df)
+weekly = get_weekly(df)
+
+if not monthly:
+    st.warning("No sufficient monthly data for time series and ABC-XYZ. Check your file.")
+    series_m = None
+    code, desc = "", ""
+else:
+    items_list = [f"{c} - {d}" for (c, d) in monthly.keys()]
+    selected = st.sidebar.selectbox("Select a product", items_list)
+    key = list(monthly.keys())[items_list.index(selected)]
+    code, desc = key
+    series_m = monthly[key]
+
+# -------------------------
+# TAB 2 — ABC–XYZ
+# -------------------------
+with tab2:
+    st.header("🧮 ABC–XYZ Analysis")
+
+    if not monthly:
+        st.info("ABC-XYZ analysis is not available because monthly data is insufficient.")
     else:
-        rows = []
-        for fname in st.session_state["uploaded_files"]:
-            has_df = fname in st.session_state["dataframes"]
-            rows.append({
-                "File Name":  fname,
-                "Routed To":  route_file(fname),
-                "DataFrame":  "Yes" if has_df else "N/A (docx)",
-                "Shape":      str(st.session_state["dataframes"][fname].shape)
-                              if has_df else "—",
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        df_abc = abc_analysis(monthly)
+        df_xyz = xyz_analysis(monthly)
 
-    if forecast_ready and st.session_state["forecast_output"] is not None:
-        st.markdown("---")
-        st.markdown("#### Forecast Output Preview (fed into Inventory)")
-        st.dataframe(
-            st.session_state["forecast_output"].head(10),
-            use_container_width=True,
-        )
+        st.subheader("ABC Analysis")
+        st.dataframe(df_abc)
 
+        st.subheader("XYZ Analysis")
+        st.dataframe(df_xyz)
 
-# ── Module: EDA ───────────────────────────────────────────────────────────────
-def render_eda():
-    st.markdown('<div class="module-header">Exploratory Data Analysis</div>', unsafe_allow_html=True)
+        st.subheader("ABC-XYZ Matrix")
+        try:
+            merged = df_abc.merge(df_xyz[["Material", "XYZ"]], on="Material", how="left")
+            merged["ABC_XYZ"] = merged["ABC"].fillna("") + merged["XYZ"].fillna("")
 
-    if not st.session_state["dataframes"]:
-        st.warning("Please upload at least one Excel/CSV file to begin EDA.")
-        return
+            if isinstance(merged, pd.DataFrame) and not merged.empty:
+                # -------------------------------------------------------
+                # DUZELTME: applymap() pandas>=2.1'de kaldirildi.
+                # Yeni API: Styler.map() kullanimiyla degistirildi.
+                # -------------------------------------------------------
+                try:
+                    # pandas >= 2.1: map() kullan
+                    styled = merged.style.map(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
+                except AttributeError:
+                    # pandas < 2.1: applymap() kullan (eski surum fallback)
+                    styled = merged.style.applymap(color_abc_xyz, subset=["ABC", "XYZ", "ABC_XYZ"])
 
-    # File selector
-    file_options = list(st.session_state["dataframes"].keys())
-    chosen_file  = st.selectbox("Select file to analyse", file_options)
-    df = st.session_state["dataframes"][chosen_file]
-
-    tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Statistics", "Distributions", "Correlations"])
-
-    with tab1:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Rows",    df.shape[0])
-        c2.metric("Columns", df.shape[1])
-        c3.metric("Missing values", int(df.isna().sum().sum()))
-        st.markdown("**First 20 rows**")
-        st.dataframe(df.head(20), use_container_width=True)
-        st.markdown("**Column types**")
-        dtypes_df = pd.DataFrame({
-            "Column": df.dtypes.index,
-            "Dtype":  df.dtypes.values.astype(str),
-            "Nulls":  df.isna().sum().values,
-            "Unique": [df[c].nunique() for c in df.columns],
-        })
-        st.dataframe(dtypes_df, use_container_width=True, hide_index=True)
-
-    with tab2:
-        st.markdown("**Descriptive statistics (numeric)**")
-        st.dataframe(df.describe().T.round(3), use_container_width=True)
-
-    with tab3:
-        st.markdown('<div class="info-callout">Connect your EDA visualisation code here (histograms, box plots, etc.)</div>',
-                    unsafe_allow_html=True)
-        # ── PLUG YOUR EDA VISUALISATION CODE HERE ──────────────────────────────
-        # from modules.eda import run_distributions
-        # run_distributions(df)
-        # ───────────────────────────────────────────────────────────────────────
-        numeric_cols = df.select_dtypes("number").columns.tolist()
-        if numeric_cols:
-            col = st.selectbox("Column to plot", numeric_cols)
-            st.bar_chart(df[col].dropna().value_counts().head(30))
-
-    with tab4:
-        numeric_df = df.select_dtypes("number")
-        if len(numeric_df.columns) >= 2:
-            st.dataframe(numeric_df.corr().round(3), use_container_width=True)
-        else:
-            st.info("Not enough numeric columns for correlation.")
-
-
-# ── Module: ABC-XYZ ───────────────────────────────────────────────────────────
-def render_abc_xyz():
-    st.markdown('<div class="module-header">ABC-XYZ Analysis</div>', unsafe_allow_html=True)
-
-    df, fname = get_df_for_module("abc_xyz")
-
-    if df is None:
-        st.warning("No ABC-XYZ data file found. Upload an Excel file that is NOT named 'motorin tüketim' or 'ForecastEOQ'.")
-        return
-
-    st.info(f"Using file: **{fname}**  |  Shape: {df.shape}")
-
-    # ── PLUG YOUR ABC-XYZ CODE HERE ────────────────────────────────────────────
-    # from modules.abc_xyz import run_abc_xyz
-    # result = run_abc_xyz(df)
-    # st.dataframe(result, use_container_width=True)
-    # ───────────────────────────────────────────────────────────────────────────
-
-    st.markdown('<div class="info-callout">Paste / import your ABC-XYZ analysis code in <code>modules/abc_xyz.py</code> and call it here.</div>',
-                unsafe_allow_html=True)
-    with st.expander("Raw data preview"):
-        st.dataframe(df.head(50), use_container_width=True)
-
-
-# ── Module: Forecast ──────────────────────────────────────────────────────────
-def render_forecast():
-    st.markdown('<div class="module-header">Demand Forecast</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="info-callout">Forecast results are automatically stored in session state and forwarded to <b>Inventory (EOQ)</b>.</div>',
-        unsafe_allow_html=True,
-    )
-
-    df, fname = get_df_for_module("forecast")
-
-    if df is None:
-        st.warning("Please upload **motorin tüketim.xlsx** to run the forecast.")
-        return
-
-    st.info(f"Using file: **{fname}**  |  Shape: {df.shape}")
-
-    with st.expander("Raw data preview"):
-        st.dataframe(df.head(30), use_container_width=True)
-
-    if st.button("Run Forecast", type="primary", use_container_width=False):
-        with st.spinner("Running forecast model..."):
-
-            # ── PLUG YOUR FORECAST CODE HERE ───────────────────────────────────
-            # from modules.forecast import run_forecast
-            # forecast_df = run_forecast(df)
-            # ───────────────────────────────────────────────────────────────────
-
-            # PLACEHOLDER — replace with your actual forecast result:
-            forecast_df = df.copy()   # <-- swap this line with your actual output
-            forecast_df["_source"] = "forecast"
-
-            # CRITICAL: store in session state so Inventory can read it
-            st.session_state["forecast_output"] = forecast_df
-            st.session_state["forecast_done"]   = True
-
-        st.success("Forecast complete! Results saved and ready for Inventory (EOQ).")
-        st.dataframe(forecast_df.head(20), use_container_width=True)
-
-    elif st.session_state["forecast_done"]:
-        st.info("Forecast already run. Results are available in Inventory (EOQ).")
-        st.dataframe(
-            st.session_state["forecast_output"].head(20),
-            use_container_width=True,
-        )
-
-
-# ── Module: Inventory (EOQ) ───────────────────────────────────────────────────
-def render_inventory():
-    st.markdown('<div class="module-header">Inventory Optimisation (EOQ / ROP)</div>', unsafe_allow_html=True)
-
-    # Priority: use forecast output; fallback to ForecastEOQ.xlsx
-    if st.session_state["forecast_done"] and st.session_state["forecast_output"] is not None:
-        df       = st.session_state["forecast_output"]
-        src_note = "Using **forecast output** as demand input."
-        badge    = "badge-ok"
-    else:
-        df, fname = get_df_for_module("inventory")
-        if df is None:
-            st.warning(
-                "No inventory data found. Either:\n"
-                "- Run the **Forecast** module first, OR\n"
-                "- Upload **ForecastEOQ.xlsx**"
-            )
-            return
-        src_note = f"Using fallback file: **{fname}** (run Forecast first for live demand data)."
-        badge    = "badge-warn"
-
-    st.markdown(f'<div class="info-callout">{src_note}</div>', unsafe_allow_html=True)
-
-    with st.expander("Input data preview"):
-        st.dataframe(df.head(30), use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("#### EOQ Parameters")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        holding_cost    = st.number_input("Holding cost per unit / year (TL)", value=50.0, min_value=0.01)
-    with col2:
-        ordering_cost   = st.number_input("Ordering cost per order (TL)",      value=200.0, min_value=0.01)
-    with col3:
-        lead_time_days  = st.number_input("Lead time (days)",                   value=7,    min_value=1)
-
-    if st.button("Calculate EOQ / ROP", type="primary"):
-        with st.spinner("Calculating..."):
-
-            # ── PLUG YOUR INVENTORY CODE HERE ──────────────────────────────────
-            # from modules.inventory import run_inventory
-            # result = run_inventory(df, holding_cost, ordering_cost, lead_time_days)
-            # ───────────────────────────────────────────────────────────────────
-
-            # PLACEHOLDER example (swap with your code):
-            import math
-            st.markdown("#### Results")
-            # Example assumes df has a column with demand — adjust column name:
-            numeric_cols = df.select_dtypes("number").columns.tolist()
-            if numeric_cols:
-                demand_col  = st.selectbox("Select demand column", numeric_cols)
-                annual_D    = float(df[demand_col].sum())
-                eoq         = math.sqrt((2 * annual_D * ordering_cost) / holding_cost)
-                daily_d     = annual_D / 365
-                rop         = daily_d * lead_time_days
-
-                r1, r2, r3 = st.columns(3)
-                r1.metric("Annual Demand",  f"{annual_D:,.0f}")
-                r2.metric("EOQ",            f"{eoq:,.1f} units")
-                r3.metric("Reorder Point",  f"{rop:,.1f} units")
+                st.markdown(styled.to_html(), unsafe_allow_html=True)
             else:
-                st.warning("No numeric columns found in the data.")
+                st.warning("ABC-XYZ matrix could not be created. Check data consistency.")
+        except Exception as e:
+            st.error(f"Error while creating ABC-XYZ matrix: {e}")
 
+# -------------------------
+# TAB 3 — FORECAST
+# -------------------------
+with tab3:
+    st.header("📈 Forecasting Models")
 
-# ── Module: Time Series Analysis ──────────────────────────────────────────────
-def render_time_series():
-    st.markdown('<div class="module-header">Time Series Analysis</div>', unsafe_allow_html=True)
+    if series_m is None:
+        st.info("Forecasting is not available because no product could be selected.")
+    else:
+        col1, col2, col3 = st.columns(3)
 
-    if not st.session_state["dataframes"]:
-        st.warning("Please upload a data file first.")
-        return
+        with col1:
+            st.subheader("ARIMA")
+            fc_arima = arima_forecast(series_m)
+            if fc_arima is not None:
+                st.line_chart(fc_arima)
+            else:
+                st.warning("ARIMA forecast could not be generated.")
 
-    file_options = list(st.session_state["dataframes"].keys())
-    chosen_file  = st.selectbox("Select file", file_options, key="ts_file")
-    df           = st.session_state["dataframes"][chosen_file]
+        with col2:
+            st.subheader("XGBoost")
+            y_test_xgb, preds_xgb, mae_xgb, rmse_xgb = ml_forecast(series_m, "xgboost")
+            if preds_xgb is not None:
+                st.write(f"MAE: {mae_xgb:.2f}, RMSE: {rmse_xgb:.2f}")
+                st.line_chart(pd.DataFrame({"Actual": y_test_xgb, "Prediction": preds_xgb}))
+            else:
+                st.warning("Insufficient data for XGBoost.")
 
-    st.info(f"File: **{chosen_file}**  |  Shape: {df.shape}")
+        with col3:
+            st.subheader("CatBoost")
+            y_test_cat, preds_cat, mae_cat, rmse_cat = ml_forecast(series_m, "catboost")
+            if preds_cat is not None:
+                st.write(f"MAE: {mae_cat:.2f}, RMSE: {rmse_cat:.2f}")
+                st.line_chart(pd.DataFrame({"Actual": y_test_cat, "Prediction": preds_cat}))
+            else:
+                st.warning("Insufficient data for CatBoost.")
 
-    # ── PLUG YOUR TIME SERIES CODE HERE ────────────────────────────────────────
-    # from modules.time_series import run_time_series
-    # run_time_series(df)
-    # ───────────────────────────────────────────────────────────────────────────
+# -------------------------
+# TAB 4 — INVENTORY (SPLIT LAYOUT)
+# -------------------------
+with tab4:
+    st.header("📦 Inventory Optimization — Simulation Based")
 
-    st.markdown('<div class="info-callout">Paste / import your Time Series Analysis code in <code>modules/time_series.py</code>.</div>',
-                unsafe_allow_html=True)
+    if series_m is None:
+        st.info("Inventory optimization is not available because no product could be selected.")
+    else:
+       import numpy as np
+        import pandas as pd
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+        from scipy import stats
+        from typing import Dict, List, Tuple
+        import math
+        import warnings
+        
+        warnings.filterwarnings("ignore")
+        
+        # ══════════════════════════════════════════════════════════════════════════════
+        # CONFIGURATION FOR ForecastEOQ.xlsx
+        # ══════════════════════════════════════════════════════════════════════════════
+        
+        EXCEL_FILE = "/content/ForecastEOQ.xlsx"
+        OUTPUT_DIR = "/content/"
+        MATERIAL_CODES = [600080, 600096, 600102, 600112, 603789, 603812, 607290, 626100, 627518, 627519]
+        
+        SHORT_NAMES: Dict[int, str] = {
+            600080: "MOTORIN",
+            600096: "TOKA 32",
+            600102: "ÇEMBER TOKA",
+            600112: "SIYAH ÇEMBER",
+            603789: "ELDİVEN",
+            603812: "KULAK TIKACI",
+            607290: "Ç.4140",
+            626100: "SAPAN",
+            627518: "BRK 77x60",
+            627519: "BRK 80x122",
+        }
+        
+        # ══════════════════════════════════════════════════════════════════════════════
+        # ORDERING COST PARAMETERS
+        # ══════════════════════════════════════════════════════════════════════════════
+        
+        ORDERING_COST = 2792  # TRY - Fixed ordering cost per order
+        HOLDING_COST_PCT = 0.25  # 25% - Annual holding cost percentage
+        SERVICE_LEVEL = 0.95  # 95% service level
+        
+        COLORS = [
+            "#2563EB", "#DC2626", "#16A34A", "#D97706", "#7C3AED",
+            "#0891B2", "#DB2777", "#65A30D", "#EA580C", "#6366F1",
+        ]
+        
+        
+        # ══════════════════════════════════════════════════════════════════════════════
+        # LOAD DATA FROM EXCEL - ForecastEOQ.xlsx (REAL DATA)
+        # ══════════════════════════════════════════════════════════════════════════════
+        
+        def load_material_data(filepath: str, material_code: int) -> Tuple[pd.DataFrame, Dict]:
+            """
+            Load real data for a material from ForecastEOQ.xlsx.
+        
+            Columns: Tarih, Mal Giriş, Tüketim Miktarı, Unit Price, Para Birimi, Lead time
+            """
+            try:
+                df = pd.read_excel(filepath, sheet_name=str(material_code))
+        
+                # Clean column names
+                df.columns = df.columns.str.strip()
+        
+                # Convert date column to datetime
+                df["Tarih"] = pd.to_datetime(df["Tarih"])
+                df = df.sort_values("Tarih").reset_index(drop=True)
+        
+                # Fill NaN values with 0
+                df["Mal Giriş"] = df["Mal Giriş"].fillna(0)
+                df["Tüketim Miktarı"] = df["Tüketim Miktarı"].fillna(0)
+        
+                # Extract metadata (from first row)
+                unit_price = float(df["Unit Price"].iloc[0]) if "Unit Price" in df.columns else 1.0
+                currency = str(df["Para Birimi"].iloc[0]) if "Para Birimi" in df.columns else "TRY"
+                lead_time = int(df["Lead time"].iloc[0]) if "Lead time" in df.columns else 2
+        
+                metadata = {
+                    "unit_price": unit_price,
+                    "currency": currency,
+                    "lead_time": lead_time,
+                    "material_code": material_code,
+                    "material_name": SHORT_NAMES.get(material_code, str(material_code)),
+                }
+        
+                return df, metadata
+        
+            except Exception as e:
+                print(f"❌ Error reading material code {material_code} → {str(e)}")
+                return None, None
+        
+        
+        # ══════════════════════════════════════════════════════════════════════════════
+        # CALCULATE REAL INVENTORY
+        # ══════════════════════════════════════════════════════════════════════════════
+        
+        def calculate_real_inventory(df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Real Inventory = Previous Inventory + Inflow - Consumption
+        
+            This works according to the logic you described!
+            """
+            df = df.copy()
+            df["Envanter"] = 0.0
+        
+            current_inv = 0.0
+            inventory_list = []
+        
+            for idx, row in df.iterrows():
+                current_inv = current_inv + row["Mal Giriş"] - row["Tüketim Miktarı"]
+                current_inv = max(0, current_inv)  # Cannot be negative
+                inventory_list.append(current_inv)
+        
+            df["Envanter"] = inventory_list
+            return df
+        
+        
+        # ══════════════════════════════════════════════════════════════════════════════
+        # CALCULATE STATISTICS
+        # ══════════════════════════════════════════════════════════════════════════════
+        
+        def calculate_statistics(df: pd.DataFrame, metadata: Dict) -> Dict:
+            """
+            Calculate EOQ and ROP based on real data.
+            """
+            consumption = df["Tüketim Miktarı"].values
+            inflow = df["Mal Giriş"].values
+            inventory = df["Envanter"].values
+        
+            # Daily averages
+            days = len(df)
+            total_consumption = consumption.sum()
+            total_inflow = inflow.sum()
+            avg_daily_consumption = total_consumption / days if days > 0 else 0
+        
+            # Standard deviation (from Consumption)
+            consumption_nonzero = consumption[consumption > 0]
+            std_consumption = consumption_nonzero.std() if len(consumption_nonzero) > 1 else avg_daily_consumption * 0.3
+        
+            # Daily standard deviation
+            std_daily = std_consumption / np.sqrt(len(df)) if len(df) > 1 else avg_daily_consumption * 0.3
+        
+            # Coefficient of Variation
+            cv = (std_daily / avg_daily_consumption * 100) if avg_daily_consumption > 0 else 0
+        
+            # EOQ Calculation
+            annual_demand = avg_daily_consumption * 365
+            holding_cost = HOLDING_COST_PCT * metadata["unit_price"]
+        
+            if annual_demand > 0 and holding_cost > 0:
+                eoq = math.sqrt((2 * annual_demand * ORDERING_COST) / holding_cost)
+            else:
+                eoq = avg_daily_consumption * 30
+        
+            eoq = max(1.0, eoq)
+        
+            # ROP Calculation (stock required during Lead Time)
+            lead_time = metadata["lead_time"]
+            lt_mean = avg_daily_consumption * lead_time
+            lt_std = std_daily * math.sqrt(lead_time)
+        
+            # Z-score (for 95% service level)
+            z = stats.norm.ppf(SERVICE_LEVEL)
+            rop = max(0.0, lt_mean + z * lt_std)
+        
+            return {
+                "material_code": metadata["material_code"],
+                "material_name": metadata["material_name"],
+                "total_days": days,
+                "total_consumption": total_consumption,
+                "total_inflow": total_inflow,
+                "avg_daily_consumption": round(avg_daily_consumption, 2),
+                "std_daily": round(std_daily, 2),
+                "cv_percent": round(cv, 1),
+                "max_inventory": float(inventory.max()),
+                "min_inventory": float(inventory.min()),
+                "avg_inventory": float(inventory.mean()),
+                "eoq": round(eoq, 2),
+                "rop": round(rop, 2),
+                "unit_price": metadata["unit_price"],
+                "currency": metadata["currency"],
+                "lead_time": lead_time,
+                "annual_demand": round(annual_demand, 0),
+            }
+        
+        
+        # ══════════════════════════════════════════════════════════════════════════════
+        # ✅ EOQ SAW-TOOTH GRAPH (WITH REAL DATA)
+        # ══════════════════════════════════════════════════════════════════════════════
+        
+        def create_eoq_graph(df: pd.DataFrame, stats: Dict, output_path: str) -> None:
+            """
+            EOQ graph based on real Inflow + Consumption data
+            """
+        
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10))
+            fig.patch.set_facecolor("#F8FAFC")
+        
+            # ─────────────────────────────────────────────────────────────────
+            # 1. INVENTORY LEVEL
+            # ─────────────────────────────────────────────────────────────────
+        
+            ax1.set_facecolor("#FFFFFF")
+            days = range(len(df))
+        
+            ax1.plot(days, df["Envanter"], color="#DC2626", linewidth=2.5,
+                     label="Real Inventory Level", marker=".", markersize=3,
+                     alpha=0.85, zorder=3)
+        
+            # ROP line
+            ax1.axhline(y=stats["rop"], color="#16A34A", linestyle="--", linewidth=2.5,
+                        label=f"Reorder Point (ROP) = {stats['rop']:.0f}", zorder=2, alpha=0.8)
+        
+            # EOQ line
+            ax1.axhline(y=stats["eoq"], color="#D97706", linestyle="--", linewidth=2,
+                        label=f"Order Quantity (EOQ) = {stats['eoq']:.0f}", zorder=1, alpha=0.6)
+        
+            # Average inventory
+            ax1.axhline(y=stats["avg_inventory"], color="#7C3AED", linestyle=":", linewidth=2.5,
+                        label=f"Average Inventory = {stats['avg_inventory']:.0f}", zorder=2, alpha=0.8)
+        
+            # Safety stock zone
+            ax1.fill_between(days, 0, stats["rop"], alpha=0.08, color="#FEA500",
+                             label="Safety Stock Zone")
+        
+            ax1.set_xlabel("Day", fontsize=12, fontweight="bold", color="#374151")
+            ax1.set_ylabel("Inventory (units)", fontsize=12, fontweight="bold", color="#374151")
+            ax1.set_title(f"📦 EOQ SAW-TOOTH GRAPH: {stats['material_name']}\nReal Inflow & Consumption Data",
+                          fontsize=13, fontweight="bold", color="#111827", pad=15)
+            ax1.legend(fontsize=10, loc="upper right", framealpha=0.95)
+            ax1.grid(True, alpha=0.25, linestyle="--", color="#9CA3AF", zorder=0)
+            ax1.spines[["top", "right"]].set_visible(False)
+        
+            info_text = (f"📊 CONFIGURATION\n"
+                        f"Code: {stats['material_code']}\n"
+                        f"Lead Time: {stats['lead_time']} days\n"
+                        f"Unit Price: {stats['currency']}{stats['unit_price']:.2f}\n"
+                        f"Avg Daily Consumption: {stats['avg_daily_consumption']:.2f}\n"
+                        f"Std Deviation: {stats['std_daily']:.2f}\n"
+                        f"CV: {stats['cv_percent']:.1f}%\n"
+                        f"Service Level: {SERVICE_LEVEL*100:.0f}%")
+        
+            ax1.text(0.02, 0.98, info_text, transform=ax1.transAxes, fontsize=9,
+                     ha="left", va="top", fontweight="bold", color="#111827",
+                     bbox=dict(boxstyle="round,pad=0.8", facecolor="#FEF3C7", alpha=0.95,
+                              edgecolor="#D97706", linewidth=2))
+        
+            # ─────────────────────────────────────────────────────────────────
+            # 2. INFLOW vs CONSUMPTION
+            # ─────────────────────────────────────────────────────────────────
+        
+            ax2.set_facecolor("#FFFFFF")
+        
+            x = np.arange(len(df))
+            width = 0.35
+        
+            bars1 = ax2.bar(x - width/2, df["Mal Giriş"], width, label="Inflow",
+                            color="#16A34A", alpha=0.8, edgecolor="white")
+            bars2 = ax2.bar(x + width/2, df["Tüketim Miktarı"], width, label="Consumption",
+                            color="#DC2626", alpha=0.8, edgecolor="white")
+        
+            ax2.set_xlabel("Day", fontsize=12, fontweight="bold", color="#374151")
+            ax2.set_ylabel("Quantity (units)", fontsize=12, fontweight="bold", color="#374151")
+            ax2.set_title("Daily Inflow vs Consumption", fontsize=12, fontweight="bold",
+                          color="#111827", pad=15)
+            ax2.legend(fontsize=10, loc="upper right")
+            ax2.grid(True, alpha=0.2, linestyle="--", axis="y")
+            ax2.spines[["top", "right"]].set_visible(False)
+        
+            # Reduce X-axis display (too many days)
+            if len(df) > 50:
+                step = len(df) // 10
+                ax2.set_xticks(range(0, len(df), step))
+        
+            plt.tight_layout()
+            plt.savefig(output_path, dpi=300, bbox_inches="tight", facecolor="#F8FAFC")
+            print(f"✅ EOQ Graph saved → {output_path}")
+            plt.close()
+        
+        
+        # ══════════════════════════════════════════════════════════════════════════════
+        # ✅ EOQ COST FUNCTION
+        # ══════════════════════════════════════════════════════════════════════════════
+        
+        def create_eoq_cost_graph(stats: Dict, output_path: str) -> None:
+            """
+            EOQ Cost Function: Ordering + Holding + Total
+            """
+        
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            fig.patch.set_facecolor("#F8FAFC")
+        
+            ax1.set_facecolor("#FFFFFF")
+        
+            annual_demand = stats["annual_demand"]
+            eoq_value = stats["eoq"]
+            unit_price = stats["unit_price"]
+        
+            Q_range = np.linspace(1, eoq_value * 3, 300)
+        
+            # Cost functions
+            ordering_cost = (annual_demand / Q_range) * ORDERING_COST
+            holding_cost = (Q_range / 2) * HOLDING_COST_PCT * unit_price
+            total_cost = ordering_cost + holding_cost
+        
+            # Plot
+            ax1.plot(Q_range, ordering_cost, linewidth=2.5, color="#DC2626",
+                     label="Ordering Cost", linestyle="--", alpha=0.8)
+            ax1.plot(Q_range, holding_cost, linewidth=2.5, color="#16A34A",
+                     label="Holding Cost", linestyle="--", alpha=0.8)
+            ax1.plot(Q_range, total_cost, linewidth=3.5, color="#7C3AED",
+                     label="Total Cost", zorder=3)
+        
+            # EOQ point
+            eoq_cost = (eoq_value / 2) * HOLDING_COST_PCT * unit_price + \
+                       (annual_demand / eoq_value) * ORDERING_COST
+        
+            ax1.scatter([eoq_value], [eoq_cost], s=300, color="#D97706", marker="*",
+                        zorder=4, edgecolor="black", linewidth=2, label=f"EOQ = {eoq_value:.0f}")
+        
+            ax1.axvline(x=eoq_value, color="#D97706", linestyle=":", linewidth=2, alpha=0.7)
+        
+            ax1.set_xlabel("Order Quantity (Q)", fontsize=11, fontweight="bold", color="#374151")
+            ax1.set_ylabel(f"Annual Cost ({stats['currency']})", fontsize=11, fontweight="bold", color="#374151")
+            ax1.set_title("EOQ Cost Tradeoff Function", fontsize=12, fontweight="bold", color="#111827")
+            ax1.legend(fontsize=10, loc="upper right", framealpha=0.95)
+            ax1.grid(True, alpha=0.2, linestyle="--")
+            ax1.spines[["top", "right"]].set_visible(False)
+        
+            # ─────────────────────────────────────────────────────────────────
+            # Cost Details
+            # ─────────────────────────────────────────────────────────────────
+        
+            ax2.axis("off")
+        
+            annual_ordering = (annual_demand / eoq_value) * ORDERING_COST
+            annual_holding = (eoq_value / 2) * HOLDING_COST_PCT * unit_price
+            total_annual = annual_ordering + annual_holding
+        
+            cost_text = f"""
+        📊 EOQ COST ANALYSIS: {stats['material_name']}
+        
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        📈 DEMAND & PARAMETERS:
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        Annual Demand:           {annual_demand:>12,.0f} units
+        Avg Daily Consumption:   {stats['avg_daily_consumption']:>12,.2f} units
+        Lead Time:               {stats['lead_time']:>12} days
+        Unit Price:              {stats['currency']}{unit_price:>12,.2f}
+        CV:                      {stats['cv_percent']:>12.1f}%
+        
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        💰 EOQ (OPTIMAL ORDER QUANTITY):
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        Ordering Cost per Order: {stats['currency']}{ORDERING_COST:>12,.2f}
+        Holding Cost Rate:       {HOLDING_COST_PCT*100:>12.1f}%
+        
+        EOQ Formula: Q* = √(2DS/h)
+          D = {annual_demand:,.0f} (annual demand)
+          S = {stats['currency']}{ORDERING_COST:,.2f} (ordering cost)
+          h = {stats['currency']}{HOLDING_COST_PCT * unit_price:,.3f} (holding cost)
+        
+        Optimal Order Quantity:  {eoq_value:>12,.0f} units
+        
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        💵 ANNUAL COST DISTRIBUTION:
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        Ordering Cost:           {stats['currency']}{annual_ordering:>12,.2f}
+        Holding Cost:            {stats['currency']}{annual_holding:>12,.2f}
+        ────────────────────────────────────────
+        TOTAL ANNUAL COST:       {stats['currency']}{total_annual:>12,.2f}
+        
+        Average Inventory:       {eoq_value/2:>12,.0f} units
+        
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        """
+        
+            ax2.text(0.05, 0.98, cost_text, transform=ax2.transAxes, fontsize=8.5,
+                     ha="left", va="top", family="monospace", color="#111827",
+                     fontweight="bold",
+                     bbox=dict(boxstyle="round,pad=1", facecolor="#FEF3C7", alpha=0.95,
+                              edgecolor="#D97706", linewidth=2))
+        
+            plt.tight_layout()
+            plt.savefig(output_path, dpi=300, bbox_inches="tight", facecolor="#F8FAFC")
+            print(f"✅ EOQ Cost Graph saved → {output_path}")
+            plt.close()
+        
+        
+        # ══════════════════════════════════════════════════════════════════════════════
+        # ✅ SUMMARY TABLE
+        # ══════════════════════════════════════════════════════════════════════════════
+        
+        def create_summary_table(all_stats: List[Dict], output_path: str) -> None:
+            """
+            Summary table for all materials
+            """
+        
+            df = pd.DataFrame(all_stats)
+            df = df.sort_values("annual_demand", ascending=False)
+        
+            # Save to CSV
+            csv_path = output_path.replace(".xlsx", ".csv")
+            df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+            print(f"✅ Summary table saved to CSV → {csv_path}")
+        
+            # Save to Excel
+            with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="Summary", index=False)
+        
+            print(f"✅ Summary table saved to Excel → {output_path}")
+        
+        
+        # ══════════════════════════════════════════════════════════════════════════════
+        # CONSOLE REPORT
+        # ══════════════════════════════════════════════════════════════════════════════
+        
+        def print_console_report(all_stats: List[Dict]) -> None:
+            """
+            Print EOQ recommendations to console
+            """
+        
+            print(f"\n{'='*180}")
+            print(f"{'🎯 EOQ OPTIMAL ORDER QUANTITY ANALYSIS':^180}")
+            print(f"{'='*180}\n")
+        
+            print(f"{'Code':<10} {'Material':<20} {'Annual Demand':>15} {'Avg Daily':>12} "
+                  f"{'Std Dev':>12} {'CV%':>8} {'ROP':>12} {'EOQ':>12} {'Unit Price':>15}")
+            print(f"{'-'*180}")
+        
+            for stat in sorted(all_stats, key=lambda x: x["annual_demand"], reverse=True):
+                print(f"{stat['material_code']:<10} {stat['material_name']:<20} "
+                      f"{stat['annual_demand']:>15,.0f} {stat['avg_daily_consumption']:>12,.2f} "
+                      f"{stat['std_daily']:>12,.2f} {stat['cv_percent']:>8.1f} "
+                      f"{stat['rop']:>12,.0f} {stat['eoq']:>12,.0f} "
+                      f"{stat['currency']}{stat['unit_price']:>14,.2f}")
+        
+            print(f"{'-'*180}\n")
+        
+        
+        # ══════════════════════════════════════════════════════════════════════════════
+        # MAIN
+        # ══════════════════════════════════════════════════════════════════════════════
+        
+        def main():
+            print(f"\n{'='*100}")
+            print(f"{'📦 EOQ ANALYSIS FROM ForecastEOQ FILE':^100}")
+            print(f"{'='*100}\n")
+        
+            all_stats = []
+        
+            for idx, material_code in enumerate(MATERIAL_CODES, 1):
+                try:
+                    print(f"[{idx}/{len(MATERIAL_CODES)}] 📥 Loading material {material_code}...")
+        
+                    # Load data
+                    df, metadata = load_material_data(EXCEL_FILE, material_code)
+        
+                    if df is None or metadata is None:
+                        print(f"⚠️  Skipping material {material_code}!\n")
+                        continue
+        
+                    # Calculate real inventory
+                    df = calculate_real_inventory(df)
+        
+                    # Calculate statistics
+                    stats = calculate_statistics(df, metadata)
+                    all_stats.append(stats)
+        
+                    print(f"     ✅ EOQ: {stats['eoq']:.0f} | ROP: {stats['rop']:.0f} | "
+                          f"Avg Daily: {stats['avg_daily_consumption']:.2f}")
+        
+                    # EOQ Graph
+                    print(f"     🎨 Creating EOQ graph...")
+                    create_eoq_graph(df, stats,
+                                   f"{OUTPUT_DIR}01_eoq_sawtooth_{material_code}_{stats['material_name'].replace(' ', '_')}.png")
+        
+                    # Cost Graph
+                    print(f"     💰 Creating cost graph...")
+                    create_eoq_cost_graph(stats,
+                                        f"{OUTPUT_DIR}02_eoq_cost_{material_code}_{stats['material_name'].replace(' ', '_')}.png")
+        
+                    print()
+        
+                except Exception as e:
+                    print(f"❌ ERROR: {material_code} → {str(e)}\n")
+                    continue
+        
+            # Summary table
+            if all_stats:
+                print(f"\n📊 Creating summary table...")
+                create_summary_table(all_stats, f"{OUTPUT_DIR}eoq_forecast_summary.xlsx")
+        
+                # Console report
+                print_console_report(all_stats)
+        
+                print(f"{'='*100}")
+                print(f"✅ ALL ANALYSIS COMPLETED!")
+                print(f"{'='*100}\n")
+            else:
+                print(f"❌ No data loaded!")
+        
+        
+        if __name__ == "__main__":
+            main()
+# -------------------------
+# TAB 5 — TIME SERIES
+# -------------------------
+with tab5:
+    st.header("⏳ Time Series")
+    if series_m is None:
+        st.info("Time series is not available because no product could be selected.")
+    else:
+        st.line_chart(series_m)
 
-    col_options = df.columns.tolist()
-    date_col    = st.selectbox("Date / time column",  col_options, key="ts_date")
-    value_col   = st.selectbox("Value column",        df.select_dtypes("number").columns.tolist(), key="ts_val")
+# -------------------------
+# TAB 6 — DASHBOARD
+# -------------------------
+with tab6:
+    st.header("📋 Summary Dashboard")
 
-    try:
-        ts_df = df[[date_col, value_col]].copy()
-        ts_df[date_col] = pd.to_datetime(ts_df[date_col], errors="coerce")
-        ts_df = ts_df.dropna().set_index(date_col).sort_index()
-        st.line_chart(ts_df)
-    except Exception as e:
-        st.error(f"Could not plot time series: {e}")
+    if series_m is None:
+        st.info("Dashboard is not available because no product could be selected.")
+    else:
+        st.subheader("Product Information")
+        st.write(f"**Code:** {code}")
+        st.write(f"**Description:** {desc}")
 
+        st.subheader("Monthly Demand")
+        st.line_chart(series_m)
 
-# ── Router ─────────────────────────────────────────────────────────────────────
-MODULE_RENDERERS = {
-    "Dashboard":            render_dashboard,
-    "EDA":                  render_eda,
-    "ABC-XYZ Analysis":     render_abc_xyz,
-    "Forecast":             render_forecast,
-    "Inventory (EOQ)":      render_inventory,
-    "Time Series Analysis": render_time_series,
-}
-MODULE_RENDERERS[st.session_state["active_module"]]()
+        st.subheader("Forecast Results")
+        if "fc_arima" in locals() and fc_arima is not None:
+            st.write("ARIMA Forecast")
+            st.line_chart(fc_arima)
 
-MODULE_RENDERERS[st.session_state["active_module"]]()
+        if "preds_xgb" in locals() and preds_xgb is not None:
+            st.write("XGBoost Forecast")
+            st.line_chart(pd.DataFrame({"Actual": y_test_xgb, "Prediction": preds_xgb}))
+
+        if "preds_cat" in locals() and preds_cat is not None:
+            st.write("CatBoost Forecast")
+            st.line_chart(pd.DataFrame({"Actual": y_test_cat, "Prediction": preds_cat}))
+
+        mean_monthly = series_m.mean()
+        std_monthly = series_m.std()
+        mean_daily = mean_monthly / 30 if mean_monthly > 0 else 0.0
+        std_daily = std_monthly / 30 if std_monthly > 0 else 0.0
+
+        st.subheader("Inventory Metrics Snapshot")
+        st.metric("Daily Mean Demand", f"{mean_daily:.2f}")
+        st.metric("Daily Std Dev", f"{std_daily:.2f}")
+        st.metric("Default Service Level", f"{SERVICE_LEVEL*100:.0f}%")
